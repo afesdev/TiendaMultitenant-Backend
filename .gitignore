@@ -1,0 +1,5 @@
+# Variables de entorno del backend
+.env
+
+# Credenciales Firebase (ajusta la ruta si es distinta)
+firebase-service-account.json
