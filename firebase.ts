@@ -1,11 +1,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import url from 'node:url'
-
 import admin from 'firebase-admin'
 
-// Ruta al archivo de credenciales de servicio
-const __dirname = path.dirname(url.fileURLToPath(import.meta.url))
+// Ruta al archivo de credenciales de servicio (compatible con CommonJS)
 const serviceAccountPath = path.join(__dirname, 'firebase-service-account.json')
 
 const raw = fs.readFileSync(serviceAccountPath, 'utf8')

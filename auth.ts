@@ -1,5 +1,5 @@
 import bcrypt from 'bcryptjs'
-import jwt from 'jsonwebtoken'
+import jwt, { type SignOptions, type Secret } from 'jsonwebtoken'
 import { config } from './config.js'
 
 const BCRYPT_ROUNDS = Number(process.env.BCRYPT_ROUNDS ?? 10)
@@ -25,10 +25,14 @@ export async function verifyPassword(plain: string, hash: string): Promise<boole
 }
 
 export function signToken(payload: JwtPayload): string {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN })
+  return jwt.sign(
+    payload,
+    JWT_SECRET as Secret,
+    { expiresIn: JWT_EXPIRES_IN as any },
+  )
 }
 
 export function verifyToken(token: string): JwtPayload {
-  return jwt.verify(token, JWT_SECRET) as JwtPayload
+  return jwt.verify(token, JWT_SECRET as Secret) as JwtPayload
 }
 
