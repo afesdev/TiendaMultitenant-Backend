@@ -4,17 +4,31 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.storage = exports.firestore = void 0;
-const node_fs_1 = __importDefault(require("node:fs"));
-const node_path_1 = __importDefault(require("node:path"));
 const firebase_admin_1 = __importDefault(require("firebase-admin"));
-// Ruta al archivo de credenciales de servicio (compatible con CommonJS)
-const serviceAccountPath = node_path_1.default.join(__dirname, 'firebase-service-account.json');
-const raw = node_fs_1.default.readFileSync(serviceAccountPath, 'utf8');
-const serviceAccount = JSON.parse(raw);
+const { FIREBASE_TYPE, FIREBASE_PROJECT_ID, FIREBASE_PRIVATE_KEY_ID, FIREBASE_PRIVATE_KEY, FIREBASE_CLIENT_EMAIL, FIREBASE_CLIENT_ID, FIREBASE_AUTH_URI, FIREBASE_TOKEN_URI, FIREBASE_AUTH_PROVIDER_CERT_URL, FIREBASE_CLIENT_CERT_URL, FIREBASE_UNIVERSE_DOMAIN, FIREBASE_STORAGE_BUCKET, } = process.env;
+if (!FIREBASE_PROJECT_ID || !FIREBASE_PRIVATE_KEY || !FIREBASE_CLIENT_EMAIL) {
+    throw new Error('Faltan variables de entorno de Firebase');
+}
+// Construir objeto de service account desde variables de entorno
+const serviceAccount = {
+    type: FIREBASE_TYPE ?? 'service_account',
+    project_id: FIREBASE_PROJECT_ID,
+    private_key_id: FIREBASE_PRIVATE_KEY_ID ?? '',
+    // Reemplazar los "\n" literales por saltos de línea reales
+    private_key: FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    client_email: FIREBASE_CLIENT_EMAIL,
+    client_id: FIREBASE_CLIENT_ID ?? '',
+    auth_uri: FIREBASE_AUTH_URI ?? 'https://accounts.google.com/o/oauth2/auth',
+    token_uri: FIREBASE_TOKEN_URI ?? 'https://oauth2.googleapis.com/token',
+    auth_provider_x509_cert_url: FIREBASE_AUTH_PROVIDER_CERT_URL ??
+        'https://www.googleapis.com/oauth2/v1/certs',
+    client_x509_cert_url: FIREBASE_CLIENT_CERT_URL ?? '',
+    universe_domain: FIREBASE_UNIVERSE_DOMAIN ?? 'googleapis.com',
+};
 if (!firebase_admin_1.default.apps.length) {
     firebase_admin_1.default.initializeApp({
         credential: firebase_admin_1.default.credential.cert(serviceAccount),
-        storageBucket: 'mishell-boutique-admin.firebasestorage.app',
+        storageBucket: FIREBASE_STORAGE_BUCKET,
     });
 }
 exports.firestore = firebase_admin_1.default.firestore();
