@@ -1287,6 +1287,7 @@ app.post('/ventas', authMiddleware, async (req, res) => {
         const pool = await (0, db_js_1.getPool)();
         tx = new db_js_1.sql.Transaction(pool);
         await tx.begin();
+        const estadoVenta = req.body.estado ?? 'Pendiente';
         const headerReq = new db_js_1.sql.Request(tx);
         headerReq
             .input('tiendaId', db_js_1.sql.UniqueIdentifier, req.user.tiendaId)
@@ -1298,7 +1299,8 @@ app.post('/ventas', authMiddleware, async (req, res) => {
             .input('subtotal', db_js_1.sql.Decimal(18, 2), subtotal)
             .input('descuentoTotal', db_js_1.sql.Decimal(18, 2), descuentoTotal)
             .input('total', db_js_1.sql.Decimal(18, 2), total)
-            .input('observacion', observacion ?? null);
+            .input('observacion', observacion ?? null)
+            .input('estado', estadoVenta);
         const headerResult = await headerReq.query(`
         INSERT INTO Ventas (
           Tienda_Id,
@@ -1311,7 +1313,8 @@ app.post('/ventas', authMiddleware, async (req, res) => {
           Subtotal,
           DescuentoTotal,
           Total,
-          Observacion
+          Observacion,
+          Estado
         )
         OUTPUT INSERTED.Id
         VALUES (
@@ -1325,7 +1328,8 @@ app.post('/ventas', authMiddleware, async (req, res) => {
           @subtotal,
           @descuentoTotal,
           @total,
-          @observacion
+          @observacion,
+          @estado
         )
       `);
         const ventaIdRow = headerResult.recordset[0];
@@ -1334,24 +1338,78 @@ app.post('/ventas', authMiddleware, async (req, res) => {
             throw new Error('No se pudo obtener el Id de la venta creada');
         }
         for (const it of items) {
+            // Insertar detalle de la venta
             const detReq = new db_js_1.sql.Request(tx);
             detReq
                 .input('ventaId', db_js_1.sql.Int, ventaId)
                 .input('productoId', db_js_1.sql.Int, it.productoId)
                 .input('cantidad', db_js_1.sql.Int, it.cantidad)
-                .input('precioUnitario', db_js_1.sql.Decimal(18, 2), it.precioUnitario);
+                .input('precioUnitario', db_js_1.sql.Decimal(18, 2), it.precioUnitario)
+                .input('varianteId', db_js_1.sql.Int, it.varianteId ?? null);
             await detReq.query(`
           INSERT INTO Venta_Detalle (
             Venta_Id,
             Producto_Id,
             Cantidad,
-            PrecioUnitario
+            PrecioUnitario,
+            Variante_Id
           )
           VALUES (
             @ventaId,
             @productoId,
             @cantidad,
-            @precioUnitario
+            @precioUnitario,
+            @varianteId
+          )
+        `);
+            // Actualizar stock del producto
+            const stockProdReq = new db_js_1.sql.Request(tx);
+            stockProdReq
+                .input('productoId', db_js_1.sql.Int, it.productoId)
+                .input('cantidad', db_js_1.sql.Int, it.cantidad);
+            await stockProdReq.query(`
+          UPDATE Productos
+          SET StockActual = ISNULL(StockActual, 0) - @cantidad
+          WHERE Id = @productoId
+        `);
+            // Actualizar stock de la variante (si aplica)
+            if (it.varianteId != null) {
+                const stockVarReq = new db_js_1.sql.Request(tx);
+                stockVarReq
+                    .input('varianteId', db_js_1.sql.Int, it.varianteId)
+                    .input('cantidad', db_js_1.sql.Int, it.cantidad);
+                await stockVarReq.query(`
+            UPDATE Producto_Variaciones
+            SET StockActual = ISNULL(StockActual, 0) - @cantidad
+            WHERE Id = @varianteId
+          `);
+            }
+            // Registrar movimiento de inventario (SALIDA)
+            const movReq = new db_js_1.sql.Request(tx);
+            movReq
+                .input('tiendaId', db_js_1.sql.UniqueIdentifier, req.user.tiendaId)
+                .input('productoId', db_js_1.sql.Int, it.productoId)
+                .input('variacionId', db_js_1.sql.Int, it.varianteId ?? null)
+                .input('cantidad', db_js_1.sql.Int, it.cantidad)
+                .input('motivo', db_js_1.sql.NVarChar, `Venta #${ventaId}`);
+            await movReq.query(`
+          INSERT INTO Movimientos_Inventario (
+            Tienda_Id,
+            Producto_Id,
+            Variacion_Id,
+            TipoMovimiento,
+            Cantidad,
+            Motivo,
+            Fecha
+          )
+          VALUES (
+            @tiendaId,
+            @productoId,
+            @variacionId,
+            'SALIDA',
+            @cantidad,
+            @motivo,
+            GETDATE()
           )
         `);
         }
@@ -1877,6 +1935,7 @@ app.get('/ventas', authMiddleware, async (req, res) => {
             v.DescuentoTotal,
             v.Total,
             v.Observacion,
+            v.Estado,
             c.Id AS ClienteId,
             c.Nombre AS ClienteNombre,
             r.Id AS RepartidorId,
@@ -1923,6 +1982,7 @@ app.get('/ventas/:id', authMiddleware, async (req, res) => {
             v.DescuentoTotal,
             v.Total,
             v.Observacion,
+            v.Estado,
             c.Id AS ClienteId,
             c.Nombre AS ClienteNombre,
             r.Id AS RepartidorId,
@@ -1944,11 +2004,26 @@ app.get('/ventas/:id', authMiddleware, async (req, res) => {
             d.Id,
             d.Producto_Id,
             p.Nombre AS ProductoNombre,
+            p.CodigoInterno,
+            p.CodigoBarras,
+            img.Url AS ImagenUrl,
+            d.Variante_Id,
+            v.Atributo AS VarianteAtributo,
+            v.Valor AS VarianteValor,
+            v.CodigoSKU AS VarianteCodigoSKU,
+            v.PrecioAdicional AS VariantePrecioAdicional,
             d.Cantidad,
             d.PrecioUnitario,
             d.Cantidad * d.PrecioUnitario AS Importe
           FROM Venta_Detalle d
           INNER JOIN Productos p ON d.Producto_Id = p.Id
+          LEFT JOIN Producto_Variaciones v ON d.Variante_Id = v.Id
+          OUTER APPLY (
+            SELECT TOP 1 Url
+            FROM Producto_Imagenes
+            WHERE Producto_Id = p.Id AND EsPrincipal = 1
+            ORDER BY Id
+          ) img
           WHERE d.Venta_Id = @ventaId
           ORDER BY d.Id
         `);
@@ -1962,13 +2037,58 @@ app.get('/ventas/:id', authMiddleware, async (req, res) => {
         return res.status(500).json({ message: 'Error al obtener detalle de la venta' });
     }
 });
+// Listar movimientos de inventario de la tienda actual
+app.get('/movimientos-inventario', authMiddleware, async (req, res) => {
+    if (!req.user) {
+        return res.status(401).json({ message: 'No autorizado' });
+    }
+    try {
+        const pool = await (0, db_js_1.getPool)();
+        const result = await pool
+            .request()
+            .input('tiendaId', req.user.tiendaId)
+            .query(`
+          SELECT
+            m.Id,
+            m.Fecha,
+            m.TipoMovimiento,
+            m.Cantidad,
+            m.Motivo,
+            m.Producto_Id,
+            p.Nombre AS ProductoNombre,
+            p.CodigoInterno,
+            p.CodigoBarras,
+            img.Url AS ImagenUrl,
+            m.Variacion_Id AS Variante_Id,
+            v.Atributo AS VarianteAtributo,
+            v.Valor AS VarianteValor,
+            v.CodigoSKU AS VarianteCodigoSKU
+          FROM Movimientos_Inventario m
+          INNER JOIN Productos p ON m.Producto_Id = p.Id
+          LEFT JOIN Producto_Variaciones v ON m.Variacion_Id = v.Id
+          OUTER APPLY (
+            SELECT TOP 1 Url
+            FROM Producto_Imagenes
+            WHERE Producto_Id = p.Id AND EsPrincipal = 1
+            ORDER BY Id
+          ) img
+          WHERE m.Tienda_Id = @tiendaId
+          ORDER BY m.Fecha DESC, m.Id DESC
+        `);
+        return res.json(result.recordset);
+    }
+    catch (error) {
+        console.error('[GET /movimientos-inventario] Error', error);
+        return res.status(500).json({ message: 'Error al obtener movimientos de inventario' });
+    }
+});
 // Actualizar cabecera de una venta (tipo, entrega, pago, descuento, observación)
 app.put('/ventas/:id', authMiddleware, async (req, res) => {
     if (!req.user) {
         return res.status(401).json({ message: 'No autorizado' });
     }
     const { id } = req.params;
-    const { tipoVenta, tipoEntrega, metodoPago, observacion, descuentoTotal } = req.body;
+    const { tipoVenta, tipoEntrega, metodoPago, observacion, descuentoTotal, estado } = req.body;
     try {
         const ventaId = Number(id);
         if (Number.isNaN(ventaId)) {
@@ -1983,7 +2103,8 @@ app.put('/ventas/:id', authMiddleware, async (req, res) => {
             .input('tipoEntrega', tipoEntrega ?? null)
             .input('metodoPago', metodoPago ?? null)
             .input('observacion', observacion ?? null)
-            .input('descuentoTotal', typeof descuentoTotal === 'number' ? descuentoTotal : null);
+            .input('descuentoTotal', typeof descuentoTotal === 'number' ? descuentoTotal : null)
+            .input('estado', estado ?? null);
         const result = await request.query(`
         DECLARE @subtotal DECIMAL(18,2);
         SELECT @subtotal = Subtotal
@@ -2010,7 +2131,8 @@ app.put('/ventas/:id', authMiddleware, async (req, res) => {
           MetodoPago = COALESCE(@metodoPago, MetodoPago),
           Observacion = COALESCE(@observacion, Observacion),
           DescuentoTotal = @desc,
-          Total = @subtotal - @desc
+          Total = @subtotal - @desc,
+          Estado = COALESCE(@estado, Estado)
         WHERE Id = @id AND Tienda_Id = @tiendaId;
 
         IF @@ROWCOUNT = 0
@@ -2029,6 +2151,7 @@ app.put('/ventas/:id', authMiddleware, async (req, res) => {
           v.DescuentoTotal,
           v.Total,
           v.Observacion,
+          v.Estado,
           c.Id AS ClienteId,
           c.Nombre AS ClienteNombre,
           r.Id AS RepartidorId,
@@ -2087,6 +2210,485 @@ app.delete('/ventas/:id', authMiddleware, async (req, res) => {
     }
 });
 // ==========================
+// APARTADOS (Panel)
+// ==========================
+// Listar apartados de la tienda actual (resumen)
+app.get('/apartados', authMiddleware, async (req, res) => {
+    if (!req.user) {
+        return res.status(401).json({ message: 'No autorizado' });
+    }
+    try {
+        const pool = await (0, db_js_1.getPool)();
+        const result = await pool
+            .request()
+            .input('tiendaId', req.user.tiendaId)
+            .query(`
+          SELECT
+            a.Id,
+            a.FechaCreacion,
+            a.FechaVencimiento,
+            a.Total,
+            a.Abonado,
+            a.Saldo,
+            CASE
+              WHEN a.Estado = 'Pendiente' AND a.FechaVencimiento < GETDATE() THEN 'Vencido'
+              ELSE a.Estado
+            END AS Estado,
+            c.Id AS ClienteId,
+            c.Nombre AS ClienteNombre,
+            c.Cedula AS ClienteCedula,
+            c.Celular AS ClienteCelular
+          FROM Apartados a
+          INNER JOIN Clientes c ON a.Cliente_Id = c.Id
+          WHERE a.Tienda_Id = @tiendaId
+          ORDER BY a.FechaCreacion DESC, a.Id DESC
+        `);
+        return res.json(result.recordset);
+    }
+    catch (error) {
+        console.error('[GET /apartados] Error', error);
+        return res.status(500).json({ message: 'Error al obtener apartados' });
+    }
+});
+// Obtener detalle de un apartado (cabecera + detalle + pagos)
+app.get('/apartados/:id', authMiddleware, async (req, res) => {
+    if (!req.user) {
+        return res.status(401).json({ message: 'No autorizado' });
+    }
+    const { id } = req.params;
+    try {
+        const apartadoId = Number(id);
+        if (Number.isNaN(apartadoId)) {
+            return res.status(400).json({ message: 'Id de apartado inválido' });
+        }
+        const pool = await (0, db_js_1.getPool)();
+        const headerResult = await pool
+            .request()
+            .input('id', apartadoId)
+            .input('tiendaId', req.user.tiendaId)
+            .query(`
+          SELECT TOP 1
+            a.Id,
+            a.FechaCreacion,
+            a.FechaVencimiento,
+            a.Total,
+            a.Abonado,
+            a.Saldo,
+            CASE
+              WHEN a.Estado = 'Pendiente' AND a.FechaVencimiento < GETDATE() THEN 'Vencido'
+              ELSE a.Estado
+            END AS Estado,
+            c.Id AS ClienteId,
+            c.Nombre AS ClienteNombre,
+            c.Cedula AS ClienteCedula,
+            c.Email AS ClienteEmail,
+            c.Celular AS ClienteCelular,
+            c.Direccion AS ClienteDireccion,
+            c.Ciudad AS ClienteCiudad
+          FROM Apartados a
+          INNER JOIN Clientes c ON a.Cliente_Id = c.Id
+          WHERE a.Id = @id AND a.Tienda_Id = @tiendaId
+        `);
+        const header = headerResult.recordset[0];
+        if (!header) {
+            return res.status(404).json({ message: 'Apartado no encontrado' });
+        }
+        const detalleResult = await pool
+            .request()
+            .input('apartadoId', apartadoId)
+            .query(`
+          SELECT
+            d.Id,
+            d.Apartado_Id,
+            d.Producto_Id,
+            p.Nombre AS ProductoNombre,
+            p.CodigoInterno,
+            p.CodigoBarras,
+            img.Url AS ImagenUrl,
+            d.Cantidad,
+            d.PrecioVenta,
+            d.Cantidad * d.PrecioVenta AS Importe
+          FROM Apartados_Detalle d
+          INNER JOIN Productos p ON d.Producto_Id = p.Id
+          OUTER APPLY (
+            SELECT TOP 1 Url
+            FROM Producto_Imagenes
+            WHERE Producto_Id = p.Id AND EsPrincipal = 1
+            ORDER BY Id
+          ) img
+          WHERE d.Apartado_Id = @apartadoId
+          ORDER BY d.Id
+        `);
+        const pagosResult = await pool
+            .request()
+            .input('apartadoId', apartadoId)
+            .query(`
+          SELECT
+            Id,
+            Apartado_Id,
+            FechaPago,
+            Monto,
+            MetodoPago,
+            Referencia,
+            Notas
+          FROM Apartado_Pagos
+          WHERE Apartado_Id = @apartadoId
+          ORDER BY FechaPago DESC, Id DESC
+        `);
+        return res.json({
+            cabecera: header,
+            detalle: detalleResult.recordset,
+            pagos: pagosResult.recordset,
+        });
+    }
+    catch (error) {
+        console.error('[GET /apartados/:id] Error', error);
+        return res.status(500).json({ message: 'Error al obtener detalle del apartado' });
+    }
+});
+// Crear apartado (cabecera + detalle + (opcional) pago inicial) + movimiento inventario (SALIDA) y descuento de stock
+app.post('/apartados', authMiddleware, async (req, res) => {
+    if (!req.user) {
+        return res.status(401).json({ message: 'No autorizado' });
+    }
+    const { clienteId, fechaVencimiento, items, pagoInicial } = req.body;
+    if (!clienteId || !fechaVencimiento || !items || items.length === 0) {
+        return res.status(400).json({ message: 'Datos incompletos para crear el apartado' });
+    }
+    const vencDate = new Date(fechaVencimiento);
+    if (Number.isNaN(vencDate.getTime())) {
+        return res.status(400).json({ message: 'Fecha de vencimiento inválida' });
+    }
+    const subtotal = items.reduce((acc, it) => acc + it.cantidad * it.precioVenta, 0);
+    if (subtotal <= 0) {
+        return res.status(400).json({ message: 'Total inválido' });
+    }
+    let tx = null;
+    try {
+        const pool = await (0, db_js_1.getPool)();
+        tx = new db_js_1.sql.Transaction(pool);
+        await tx.begin();
+        // Validar stock (producto base) antes de descontar
+        for (const it of items) {
+            const stockRes = await new db_js_1.sql.Request(tx)
+                .input('productoId', db_js_1.sql.Int, it.productoId)
+                .input('tiendaId', db_js_1.sql.UniqueIdentifier, req.user.tiendaId)
+                .query(`
+            SELECT TOP 1 StockActual
+            FROM Productos
+            WHERE Id = @productoId AND Tienda_Id = @tiendaId
+          `);
+            const row = stockRes.recordset[0];
+            const stock = row?.StockActual ?? 0;
+            if (it.cantidad <= 0) {
+                throw new Error('Cantidad inválida en un ítem del apartado');
+            }
+            if (stock < it.cantidad) {
+                throw new Error('Stock insuficiente para crear el apartado');
+            }
+        }
+        // 1) Crear cabecera
+        const headerRes = await new db_js_1.sql.Request(tx)
+            .input('tiendaId', db_js_1.sql.UniqueIdentifier, req.user.tiendaId)
+            .input('clienteId', db_js_1.sql.Int, clienteId)
+            .input('fechaVenc', db_js_1.sql.DateTime, vencDate)
+            .input('total', db_js_1.sql.Decimal(18, 2), subtotal)
+            .query(`
+          INSERT INTO Apartados (
+            Tienda_Id,
+            Cliente_Id,
+            FechaCreacion,
+            FechaVencimiento,
+            Total,
+            Abonado,
+            Estado
+          )
+          OUTPUT INSERTED.Id
+          VALUES (
+            @tiendaId,
+            @clienteId,
+            GETDATE(),
+            @fechaVenc,
+            @total,
+            0,
+            'Pendiente'
+          )
+        `);
+        const apartadoId = headerRes.recordset[0]?.Id;
+        if (!apartadoId) {
+            throw new Error('No se pudo obtener el Id del apartado creado');
+        }
+        // 2) Insertar detalle + descontar stock + movimiento inventario (SALIDA)
+        for (const it of items) {
+            const detReq = new db_js_1.sql.Request(tx);
+            detReq
+                .input('apartadoId', db_js_1.sql.Int, apartadoId)
+                .input('productoId', db_js_1.sql.Int, it.productoId)
+                .input('cantidad', db_js_1.sql.Int, it.cantidad)
+                .input('precioVenta', db_js_1.sql.Decimal(18, 2), it.precioVenta);
+            await detReq.query(`
+          INSERT INTO Apartados_Detalle (
+            Apartado_Id,
+            Producto_Id,
+            Cantidad,
+            PrecioVenta
+          )
+          VALUES (
+            @apartadoId,
+            @productoId,
+            @cantidad,
+            @precioVenta
+          )
+        `);
+            await new db_js_1.sql.Request(tx)
+                .input('productoId', db_js_1.sql.Int, it.productoId)
+                .input('cantidad', db_js_1.sql.Int, it.cantidad)
+                .query(`
+            UPDATE Productos
+            SET StockActual = ISNULL(StockActual, 0) - @cantidad
+            WHERE Id = @productoId
+          `);
+            await new db_js_1.sql.Request(tx)
+                .input('tiendaId', db_js_1.sql.UniqueIdentifier, req.user.tiendaId)
+                .input('productoId', db_js_1.sql.Int, it.productoId)
+                .input('variacionId', db_js_1.sql.Int, null)
+                .input('cantidad', db_js_1.sql.Int, it.cantidad)
+                .input('motivo', db_js_1.sql.NVarChar, `Apartado #${apartadoId}`)
+                .query(`
+            INSERT INTO Movimientos_Inventario (
+              Tienda_Id,
+              Producto_Id,
+              Variacion_Id,
+              TipoMovimiento,
+              Cantidad,
+              Motivo,
+              Fecha
+            )
+            VALUES (
+              @tiendaId,
+              @productoId,
+              @variacionId,
+              'SALIDA',
+              @cantidad,
+              @motivo,
+              GETDATE()
+            )
+          `);
+        }
+        // 3) Pago inicial (opcional)
+        if (pagoInicial && typeof pagoInicial.monto === 'number' && pagoInicial.monto > 0) {
+            const monto = pagoInicial.monto;
+            await new db_js_1.sql.Request(tx)
+                .input('apartadoId', db_js_1.sql.Int, apartadoId)
+                .input('monto', db_js_1.sql.Decimal(18, 2), monto)
+                .input('metodoPago', db_js_1.sql.NVarChar, pagoInicial.metodoPago)
+                .input('referencia', db_js_1.sql.NVarChar, pagoInicial.referencia ?? null)
+                .input('notas', db_js_1.sql.NVarChar, pagoInicial.notas ?? null)
+                .query(`
+            INSERT INTO Apartado_Pagos (
+              Apartado_Id,
+              FechaPago,
+              Monto,
+              MetodoPago,
+              Referencia,
+              Notas
+            )
+            VALUES (
+              @apartadoId,
+              GETDATE(),
+              @monto,
+              @metodoPago,
+              @referencia,
+              @notas
+            )
+          `);
+            await new db_js_1.sql.Request(tx)
+                .input('apartadoId', db_js_1.sql.Int, apartadoId)
+                .input('monto', db_js_1.sql.Decimal(18, 2), monto)
+                .query(`
+            UPDATE Apartados
+            SET Abonado = ISNULL(Abonado, 0) + @monto
+            WHERE Id = @apartadoId;
+
+            UPDATE Apartados
+            SET Estado = CASE WHEN Abonado >= Total THEN 'Completado' ELSE Estado END
+            WHERE Id = @apartadoId;
+          `);
+        }
+        await tx.commit();
+        return res.status(201).json({ message: 'Apartado creado correctamente', apartadoId });
+    }
+    catch (error) {
+        if (tx) {
+            try {
+                await tx.rollback();
+            }
+            catch {
+                // ignore
+            }
+        }
+        const msg = error instanceof Error ? error.message : 'Error al crear apartado';
+        console.error('[POST /apartados] Error', error);
+        return res.status(500).json({ message: msg });
+    }
+});
+// Agregar pago a un apartado y actualizar abonado/estado
+app.post('/apartados/:id/pagos', authMiddleware, async (req, res) => {
+    if (!req.user) {
+        return res.status(401).json({ message: 'No autorizado' });
+    }
+    const { id } = req.params;
+    const { monto, metodoPago, referencia, notas } = req.body;
+    const apartadoId = Number(id);
+    if (Number.isNaN(apartadoId)) {
+        return res.status(400).json({ message: 'Id de apartado inválido' });
+    }
+    if (typeof monto !== 'number' || Number.isNaN(monto) || monto <= 0) {
+        return res.status(400).json({ message: 'Monto inválido' });
+    }
+    if (!metodoPago) {
+        return res.status(400).json({ message: 'Método de pago requerido' });
+    }
+    let tx = null;
+    try {
+        const pool = await (0, db_js_1.getPool)();
+        tx = new db_js_1.sql.Transaction(pool);
+        await tx.begin();
+        const existsRes = await new db_js_1.sql.Request(tx)
+            .input('id', db_js_1.sql.Int, apartadoId)
+            .input('tiendaId', db_js_1.sql.UniqueIdentifier, req.user.tiendaId)
+            .query(`
+          SELECT TOP 1 Id, Total, Abonado
+          FROM Apartados
+          WHERE Id = @id AND Tienda_Id = @tiendaId
+        `);
+        const row = existsRes.recordset[0];
+        if (!row) {
+            await tx.rollback();
+            return res.status(404).json({ message: 'Apartado no encontrado' });
+        }
+        await new db_js_1.sql.Request(tx)
+            .input('apartadoId', db_js_1.sql.Int, apartadoId)
+            .input('monto', db_js_1.sql.Decimal(18, 2), monto)
+            .input('metodoPago', db_js_1.sql.NVarChar, metodoPago)
+            .input('referencia', db_js_1.sql.NVarChar, referencia ?? null)
+            .input('notas', db_js_1.sql.NVarChar, notas ?? null)
+            .query(`
+          INSERT INTO Apartado_Pagos (
+            Apartado_Id,
+            FechaPago,
+            Monto,
+            MetodoPago,
+            Referencia,
+            Notas
+          )
+          VALUES (
+            @apartadoId,
+            GETDATE(),
+            @monto,
+            @metodoPago,
+            @referencia,
+            @notas
+          )
+        `);
+        await new db_js_1.sql.Request(tx)
+            .input('apartadoId', db_js_1.sql.Int, apartadoId)
+            .input('monto', db_js_1.sql.Decimal(18, 2), monto)
+            .query(`
+          UPDATE Apartados
+          SET Abonado = ISNULL(Abonado, 0) + @monto
+          WHERE Id = @apartadoId;
+
+          UPDATE Apartados
+          SET Estado = CASE WHEN Abonado >= Total THEN 'Completado' ELSE Estado END
+          WHERE Id = @apartadoId;
+        `);
+        await tx.commit();
+        return res.json({ message: 'Pago registrado correctamente' });
+    }
+    catch (error) {
+        if (tx) {
+            try {
+                await tx.rollback();
+            }
+            catch {
+                // ignore
+            }
+        }
+        console.error('[POST /apartados/:id/pagos] Error', error);
+        return res.status(500).json({ message: 'Error al registrar pago' });
+    }
+});
+// Actualizar un apartado (estado y/o fecha de vencimiento)
+app.put('/apartados/:id', authMiddleware, async (req, res) => {
+    if (!req.user) {
+        return res.status(401).json({ message: 'No autorizado' });
+    }
+    const { id } = req.params;
+    const { estado, fechaVencimiento } = req.body;
+    const apartadoId = Number(id);
+    if (Number.isNaN(apartadoId)) {
+        return res.status(400).json({ message: 'Id de apartado inválido' });
+    }
+    let vencDate = null;
+    if (fechaVencimiento) {
+        const d = new Date(fechaVencimiento);
+        if (Number.isNaN(d.getTime())) {
+            return res.status(400).json({ message: 'Fecha de vencimiento inválida' });
+        }
+        vencDate = d;
+    }
+    const allowed = new Set(['Pendiente', 'Completado', 'Vencido']);
+    if (estado != null && !allowed.has(estado)) {
+        return res.status(400).json({ message: 'Estado inválido' });
+    }
+    try {
+        const pool = await (0, db_js_1.getPool)();
+        const result = await pool
+            .request()
+            .input('id', db_js_1.sql.Int, apartadoId)
+            .input('tiendaId', db_js_1.sql.UniqueIdentifier, req.user.tiendaId)
+            .input('estado', db_js_1.sql.NVarChar, estado ?? null)
+            .input('fechaVenc', db_js_1.sql.DateTime, vencDate)
+            .query(`
+          UPDATE Apartados
+          SET
+            Estado = COALESCE(@estado, Estado),
+            FechaVencimiento = COALESCE(@fechaVenc, FechaVencimiento)
+          WHERE Id = @id AND Tienda_Id = @tiendaId;
+
+          IF @@ROWCOUNT = 0
+          BEGIN
+            SELECT -1 AS Id;
+            RETURN;
+          END
+
+          SELECT
+            a.Id,
+            a.FechaCreacion,
+            a.FechaVencimiento,
+            a.Total,
+            a.Abonado,
+            a.Saldo,
+            CASE
+              WHEN a.Estado = 'Pendiente' AND a.FechaVencimiento < GETDATE() THEN 'Vencido'
+              ELSE a.Estado
+            END AS Estado
+          FROM Apartados a
+          WHERE a.Id = @id AND a.Tienda_Id = @tiendaId;
+        `);
+        const row = result.recordset[0];
+        if (!row || row.Id === -1) {
+            return res.status(404).json({ message: 'Apartado no encontrado' });
+        }
+        return res.json(row);
+    }
+    catch (error) {
+        console.error('[PUT /apartados/:id] Error', error);
+        return res.status(500).json({ message: 'Error al actualizar apartado' });
+    }
+});
+// ==========================
 // ENDPOINTS PÚBLICOS (Ecommerce)
 // ==========================
 // Obtener información de la tienda por slug
@@ -2114,6 +2716,122 @@ app.get('/public/tiendas/:slug', async (req, res) => {
     catch (error) {
         console.error('[GET /public/tiendas/:slug] Error', error);
         res.status(500).json({ message: 'Error al obtener la tienda' });
+    }
+});
+// Obtener datos de la tienda actual (panel)
+app.get('/tienda', authMiddleware, async (req, res) => {
+    if (!req.user) {
+        return res.status(401).json({ message: 'No autorizado' });
+    }
+    try {
+        const pool = await (0, db_js_1.getPool)();
+        const result = await pool
+            .request()
+            .input('tiendaId', req.user.tiendaId)
+            .query(`
+          SELECT Id, NombreComercial, Slug, EmailContacto, Configuracion, Activo, FechaCreacion
+          FROM Tiendas
+          WHERE Id = @tiendaId
+        `);
+        if (result.recordset.length === 0) {
+            return res.status(404).json({ message: 'Tienda no encontrada' });
+        }
+        const tienda = result.recordset[0];
+        let configuracionParsed = null;
+        if (tienda.Configuracion) {
+            try {
+                configuracionParsed = JSON.parse(tienda.Configuracion);
+            }
+            catch {
+                configuracionParsed = null;
+            }
+        }
+        return res.json({
+            id: tienda.Id,
+            nombreComercial: tienda.NombreComercial,
+            slug: tienda.Slug,
+            emailContacto: tienda.EmailContacto,
+            configuracion: configuracionParsed,
+            activo: tienda.Activo,
+            fechaCreacion: tienda.FechaCreacion,
+        });
+    }
+    catch (error) {
+        console.error('[GET /tienda] Error', error);
+        return res.status(500).json({ message: 'Error al obtener datos de la tienda' });
+    }
+});
+// Actualizar datos básicos de la tienda actual (panel)
+app.put('/tienda', authMiddleware, async (req, res) => {
+    if (!req.user) {
+        return res.status(401).json({ message: 'No autorizado' });
+    }
+    const { nombreComercial, slug, emailContacto, configuracion } = req.body;
+    if (!nombreComercial || !slug || !emailContacto) {
+        return res.status(400).json({
+            message: 'nombreComercial, slug y emailContacto son obligatorios',
+        });
+    }
+    let configuracionJson = null;
+    if (configuracion != null) {
+        try {
+            configuracionJson = JSON.stringify(configuracion);
+        }
+        catch {
+            return res.status(400).json({ message: 'Configuración inválida (no es JSON serializable)' });
+        }
+    }
+    try {
+        const pool = await (0, db_js_1.getPool)();
+        const request = pool
+            .request()
+            .input('tiendaId', req.user.tiendaId)
+            .input('nombreComercial', nombreComercial)
+            .input('slug', slug)
+            .input('emailContacto', emailContacto)
+            .input('configuracion', configuracionJson);
+        // Validar que el slug no se repita en otra tienda
+        const slugResult = await request.query(`
+        IF EXISTS (
+          SELECT 1 FROM Tiendas
+          WHERE Slug = @slug AND Id <> @tiendaId
+        )
+        BEGIN
+          SELECT 1 AS SlugEnUso;
+        END
+        ELSE
+        BEGIN
+          SELECT 0 AS SlugEnUso;
+        END
+      `);
+        const slugEnUso = slugResult.recordset[0]?.SlugEnUso === 1;
+        if (slugEnUso) {
+            return res.status(409).json({ message: 'El slug ya está en uso por otra tienda' });
+        }
+        const updateResult = await pool
+            .request()
+            .input('tiendaId', req.user.tiendaId)
+            .input('nombreComercial', nombreComercial)
+            .input('slug', slug)
+            .input('emailContacto', emailContacto)
+            .input('configuracion', configuracionJson)
+            .query(`
+          UPDATE Tiendas
+          SET
+            NombreComercial = @nombreComercial,
+            Slug = @slug,
+            EmailContacto = @emailContacto,
+            Configuracion = @configuracion
+          WHERE Id = @tiendaId
+        `);
+        if (updateResult.rowsAffected[0] === 0) {
+            return res.status(404).json({ message: 'Tienda no encontrada' });
+        }
+        return res.json({ message: 'Tienda actualizada correctamente' });
+    }
+    catch (error) {
+        console.error('[PUT /tienda] Error', error);
+        return res.status(500).json({ message: 'Error al actualizar la tienda' });
     }
 });
 // Listar categorías visibles de una tienda
@@ -2245,18 +2963,27 @@ app.post('/public/pedidos', async (req, res) => {
     if (!tiendaSlug || !cliente || !carrito || carrito.length === 0) {
         return res.status(400).json({ message: 'Datos incompletos para procesar el pedido' });
     }
+    let tx = null;
     try {
         const pool = await (0, db_js_1.getPool)();
+        tx = new db_js_1.sql.Transaction(pool);
+        await tx.begin();
         // 1. Validar Tienda
-        const tiendaResult = await pool.request()
+        const tiendaResult = await new db_js_1.sql.Request(tx)
             .input('slug', tiendaSlug)
             .query('SELECT Id FROM Tiendas WHERE Slug = @slug AND Activo = 1');
         if (tiendaResult.recordset.length === 0) {
+            try {
+                await tx.rollback();
+            }
+            catch {
+                // ignore
+            }
             return res.status(404).json({ message: 'Tienda no encontrada' });
         }
         const tiendaId = tiendaResult.recordset[0].Id;
         // 2. Upsert Cliente
-        const clienteResult = await pool.request()
+        const clienteResult = await new db_js_1.sql.Request(tx)
             .input('tiendaId', tiendaId)
             .input('cedula', cliente.cedula)
             .input('nombre', cliente.nombre)
@@ -2283,7 +3010,7 @@ app.post('/public/pedidos', async (req, res) => {
         // 3. Calcular Totales y crear Venta
         const subtotal = carrito.reduce((acc, item) => acc + (item.cantidad * item.precioUnitario), 0);
         const total = subtotal; // Por ahora sin impuestos ni descuentos adicionales desde el front
-        const ventaResult = await pool.request()
+        const ventaResult = await new db_js_1.sql.Request(tx)
             .input('tiendaId', tiendaId)
             .input('clienteId', clienteId)
             .input('tipoVenta', 'Online')
@@ -2293,37 +3020,74 @@ app.post('/public/pedidos', async (req, res) => {
             .input('total', total)
             .input('observacion', observacionGeneral || null)
             .query(`
-        INSERT INTO Ventas (Tienda_Id, Cliente_Id, TipoVenta, TipoEntrega, MetodoPago, Subtotal, Total, Observacion)
-        VALUES (@tiendaId, @clienteId, @tipoVenta, @tipoEntrega, @metodoPago, @subtotal, @total, @observacion);
+        INSERT INTO Ventas (Tienda_Id, Cliente_Id, TipoVenta, TipoEntrega, MetodoPago, Subtotal, Total, Observacion, Estado)
+        VALUES (@tiendaId, @clienteId, @tipoVenta, @tipoEntrega, @metodoPago, @subtotal, @total, @observacion, 'Pendiente');
         SELECT SCOPE_IDENTITY() AS Id;
       `);
         const ventaId = ventaResult.recordset[0].Id;
         // 4. Insertar Detalle y descontar stock (simplificado)
         for (const item of carrito) {
-            await pool.request()
+            await new db_js_1.sql.Request(tx)
                 .input('ventaId', ventaId)
                 .input('productoId', item.productoId)
                 .input('cantidad', item.cantidad)
                 .input('precioUnitario', item.precioUnitario)
+                .input('varianteId', item.varianteId ?? null)
                 .query(`
-          INSERT INTO Venta_Detalle (Venta_Id, Producto_Id, Cantidad, PrecioUnitario)
-          VALUES (@ventaId, @productoId, @cantidad, @precioUnitario);
+          INSERT INTO Venta_Detalle (Venta_Id, Producto_Id, Cantidad, PrecioUnitario, Variante_Id)
+          VALUES (@ventaId, @productoId, @cantidad, @precioUnitario, @varianteId);
           
           UPDATE Productos 
           SET StockActual = StockActual - @cantidad 
           WHERE Id = @productoId;
         `);
+            // Registrar movimiento de inventario (SALIDA) para pedidos online
+            await new db_js_1.sql.Request(tx)
+                .input('tiendaId', tiendaId)
+                .input('productoId', item.productoId)
+                .input('variacionId', item.varianteId ?? null)
+                .input('cantidad', item.cantidad)
+                .input('motivo', db_js_1.sql.NVarChar, `Pedido Online #${ventaId}`)
+                .query(`
+          INSERT INTO Movimientos_Inventario (
+            Tienda_Id,
+            Producto_Id,
+            Variacion_Id,
+            TipoMovimiento,
+            Cantidad,
+            Motivo,
+            Fecha
+          )
+          VALUES (
+            @tiendaId,
+            @productoId,
+            @variacionId,
+            'SALIDA',
+            @cantidad,
+            @motivo,
+            GETDATE()
+          )
+        `);
             if (item.varianteId) {
-                await pool.request()
+                await new db_js_1.sql.Request(tx)
                     .input('varianteId', item.varianteId)
                     .input('cantidad', item.cantidad)
                     .query('UPDATE Producto_Variaciones SET StockActual = StockActual - @cantidad WHERE Id = @varianteId');
             }
         }
+        await tx.commit();
         res.json({ message: 'Pedido creado exitosamente', pedidoId: ventaId });
     }
     catch (error) {
         console.error('[POST /public/pedidos] Error', error);
+        if (tx) {
+            try {
+                await tx.rollback();
+            }
+            catch {
+                // ignore
+            }
+        }
         res.status(500).json({ message: 'Error al procesar el pedido' });
     }
 });
