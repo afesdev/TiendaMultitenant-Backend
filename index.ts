@@ -1621,17 +1621,21 @@ app.post(
       observacion,
       descuentoTotal: descuentoTotalBody,
       items,
-    } =
-      req.body as {
-        clienteId: number
-        repartidorId?: number | null
-        tipoVenta?: string
-        tipoEntrega?: string
-        metodoPago?: string
-        observacion?: string
-        descuentoTotal?: number
-        items: { productoId: number; cantidad: number; precioUnitario: number }[]
-      }
+    } = req.body as {
+      clienteId: number
+      repartidorId?: number | null
+      tipoVenta?: string
+      tipoEntrega?: string
+      metodoPago?: string
+      observacion?: string
+      descuentoTotal?: number
+      items: {
+        productoId: number
+        cantidad: number
+        precioUnitario: number
+        varianteId?: number | null
+      }[]
+    }
 
     if (!clienteId || !Array.isArray(items) || items.length === 0) {
       return res
@@ -1720,25 +1724,85 @@ app.post(
       }
 
       for (const it of items) {
+        // Insertar detalle de la venta
         const detReq = new sql.Request(tx)
         detReq
           .input('ventaId', sql.Int, ventaId)
           .input('productoId', sql.Int, it.productoId)
           .input('cantidad', sql.Int, it.cantidad)
           .input('precioUnitario', sql.Decimal(18, 2), it.precioUnitario)
+          .input('varianteId', sql.Int, it.varianteId ?? null)
 
         await detReq.query(`
           INSERT INTO Venta_Detalle (
             Venta_Id,
             Producto_Id,
             Cantidad,
-            PrecioUnitario
+            PrecioUnitario,
+            Variante_Id
           )
           VALUES (
             @ventaId,
             @productoId,
             @cantidad,
-            @precioUnitario
+            @precioUnitario,
+            @varianteId
+          )
+        `)
+
+        // Actualizar stock del producto
+        const stockProdReq = new sql.Request(tx)
+        stockProdReq
+          .input('productoId', sql.Int, it.productoId)
+          .input('cantidad', sql.Int, it.cantidad)
+
+        await stockProdReq.query(`
+          UPDATE Productos
+          SET StockActual = ISNULL(StockActual, 0) - @cantidad
+          WHERE Id = @productoId
+        `)
+
+        // Actualizar stock de la variante (si aplica)
+        if (it.varianteId != null) {
+          const stockVarReq = new sql.Request(tx)
+          stockVarReq
+            .input('varianteId', sql.Int, it.varianteId)
+            .input('cantidad', sql.Int, it.cantidad)
+
+          await stockVarReq.query(`
+            UPDATE Producto_Variaciones
+            SET StockActual = ISNULL(StockActual, 0) - @cantidad
+            WHERE Id = @varianteId
+          `)
+        }
+
+        // Registrar movimiento de inventario (SALIDA)
+        const movReq = new sql.Request(tx)
+        movReq
+          .input('tiendaId', sql.UniqueIdentifier, req.user.tiendaId)
+          .input('productoId', sql.Int, it.productoId)
+          .input('variacionId', sql.Int, it.varianteId ?? null)
+          .input('cantidad', sql.Int, it.cantidad)
+          .input('motivo', sql.NVarChar, `Venta #${ventaId}`)
+
+        await movReq.query(`
+          INSERT INTO Movimientos_Inventario (
+            Tienda_Id,
+            Producto_Id,
+            Variacion_Id,
+            TipoMovimiento,
+            Cantidad,
+            Motivo,
+            Fecha
+          )
+          VALUES (
+            @tiendaId,
+            @productoId,
+            @variacionId,
+            'SALIDA',
+            @cantidad,
+            @motivo,
+            GETDATE()
           )
         `)
       }
@@ -2494,11 +2558,25 @@ app.get(
             d.Id,
             d.Producto_Id,
             p.Nombre AS ProductoNombre,
+            p.CodigoInterno,
+            p.CodigoBarras,
+            img.Url AS ImagenUrl,
+            d.Variante_Id,
+            v.Atributo AS VarianteAtributo,
+            v.Valor AS VarianteValor,
+            v.CodigoSKU AS VarianteCodigoSKU,
             d.Cantidad,
             d.PrecioUnitario,
             d.Cantidad * d.PrecioUnitario AS Importe
           FROM Venta_Detalle d
           INNER JOIN Productos p ON d.Producto_Id = p.Id
+          LEFT JOIN Producto_Variaciones v ON d.Variante_Id = v.Id
+          OUTER APPLY (
+            SELECT TOP 1 Url
+            FROM Producto_Imagenes
+            WHERE Producto_Id = p.Id AND EsPrincipal = 1
+            ORDER BY Id
+          ) img
           WHERE d.Venta_Id = @ventaId
           ORDER BY d.Id
         `)
@@ -2510,6 +2588,57 @@ app.get(
     } catch (error) {
       console.error('[GET /ventas/:id] Error', error)
       return res.status(500).json({ message: 'Error al obtener detalle de la venta' })
+    }
+  },
+)
+
+// Listar movimientos de inventario de la tienda actual
+app.get(
+  '/movimientos-inventario',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'No autorizado' })
+    }
+
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('tiendaId', req.user.tiendaId)
+        .query(`
+          SELECT
+            m.Id,
+            m.Fecha,
+            m.TipoMovimiento,
+            m.Cantidad,
+            m.Motivo,
+            m.Producto_Id,
+            p.Nombre AS ProductoNombre,
+            p.CodigoInterno,
+            p.CodigoBarras,
+            img.Url AS ImagenUrl,
+            m.Variacion_Id AS Variante_Id,
+            v.Atributo AS VarianteAtributo,
+            v.Valor AS VarianteValor,
+            v.CodigoSKU AS VarianteCodigoSKU
+          FROM Movimientos_Inventario m
+          INNER JOIN Productos p ON m.Producto_Id = p.Id
+          LEFT JOIN Producto_Variaciones v ON m.Variacion_Id = v.Id
+          OUTER APPLY (
+            SELECT TOP 1 Url
+            FROM Producto_Imagenes
+            WHERE Producto_Id = p.Id AND EsPrincipal = 1
+            ORDER BY Id
+          ) img
+          WHERE m.Tienda_Id = @tiendaId
+          ORDER BY m.Fecha DESC, m.Id DESC
+        `)
+
+      return res.json(result.recordset)
+    } catch (error) {
+      console.error('[GET /movimientos-inventario] Error', error)
+      return res.status(500).json({ message: 'Error al obtener movimientos de inventario' })
     }
   },
 )
@@ -2714,6 +2843,155 @@ app.get('/public/tiendas/:slug', async (req, res) => {
     res.status(500).json({ message: 'Error al obtener la tienda' })
   }
 })
+
+// Obtener datos de la tienda actual (panel)
+app.get(
+  '/tienda',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'No autorizado' })
+    }
+
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('tiendaId', req.user.tiendaId)
+        .query(`
+          SELECT Id, NombreComercial, Slug, EmailContacto, Configuracion, Activo, FechaCreacion
+          FROM Tiendas
+          WHERE Id = @tiendaId
+        `)
+
+      if (result.recordset.length === 0) {
+        return res.status(404).json({ message: 'Tienda no encontrada' })
+      }
+
+      const tienda = result.recordset[0] as {
+        Id: string
+        NombreComercial: string
+        Slug: string
+        EmailContacto: string
+        Configuracion: string | null
+        Activo: boolean
+        FechaCreacion: Date
+      }
+
+      let configuracionParsed: unknown = null
+      if (tienda.Configuracion) {
+        try {
+          configuracionParsed = JSON.parse(tienda.Configuracion)
+        } catch {
+          configuracionParsed = null
+        }
+      }
+
+      return res.json({
+        id: tienda.Id,
+        nombreComercial: tienda.NombreComercial,
+        slug: tienda.Slug,
+        emailContacto: tienda.EmailContacto,
+        configuracion: configuracionParsed,
+        activo: tienda.Activo,
+        fechaCreacion: tienda.FechaCreacion,
+      })
+    } catch (error) {
+      console.error('[GET /tienda] Error', error)
+      return res.status(500).json({ message: 'Error al obtener datos de la tienda' })
+    }
+  },
+)
+
+// Actualizar datos básicos de la tienda actual (panel)
+app.put(
+  '/tienda',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'No autorizado' })
+    }
+
+    const { nombreComercial, slug, emailContacto, configuracion } = req.body as {
+      nombreComercial?: string
+      slug?: string
+      emailContacto?: string
+      configuracion?: unknown
+    }
+
+    if (!nombreComercial || !slug || !emailContacto) {
+      return res.status(400).json({
+        message: 'nombreComercial, slug y emailContacto son obligatorios',
+      })
+    }
+
+    let configuracionJson: string | null = null
+    if (configuracion != null) {
+      try {
+        configuracionJson = JSON.stringify(configuracion)
+      } catch {
+        return res.status(400).json({ message: 'Configuración inválida (no es JSON serializable)' })
+      }
+    }
+
+    try {
+      const pool = await getPool()
+      const request = pool
+        .request()
+        .input('tiendaId', req.user.tiendaId)
+        .input('nombreComercial', nombreComercial)
+        .input('slug', slug)
+        .input('emailContacto', emailContacto)
+        .input('configuracion', configuracionJson)
+
+      // Validar que el slug no se repita en otra tienda
+      const slugResult = await request.query(`
+        IF EXISTS (
+          SELECT 1 FROM Tiendas
+          WHERE Slug = @slug AND Id <> @tiendaId
+        )
+        BEGIN
+          SELECT 1 AS SlugEnUso;
+        END
+        ELSE
+        BEGIN
+          SELECT 0 AS SlugEnUso;
+        END
+      `)
+
+      const slugEnUso = slugResult.recordset[0]?.SlugEnUso === 1
+      if (slugEnUso) {
+        return res.status(409).json({ message: 'El slug ya está en uso por otra tienda' })
+      }
+
+      const updateResult = await pool
+        .request()
+        .input('tiendaId', req.user.tiendaId)
+        .input('nombreComercial', nombreComercial)
+        .input('slug', slug)
+        .input('emailContacto', emailContacto)
+        .input('configuracion', configuracionJson)
+        .query(`
+          UPDATE Tiendas
+          SET
+            NombreComercial = @nombreComercial,
+            Slug = @slug,
+            EmailContacto = @emailContacto,
+            Configuracion = @configuracion
+          WHERE Id = @tiendaId
+        `)
+
+      if (updateResult.rowsAffected[0] === 0) {
+        return res.status(404).json({ message: 'Tienda no encontrada' })
+      }
+
+      return res.json({ message: 'Tienda actualizada correctamente' })
+    } catch (error) {
+      console.error('[PUT /tienda] Error', error)
+      return res.status(500).json({ message: 'Error al actualizar la tienda' })
+    }
+  },
+)
 
 // Listar categorías visibles de una tienda
 app.get('/public/tiendas/:slug/categorias', async (req, res) => {
