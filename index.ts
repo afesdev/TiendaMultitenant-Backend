@@ -3271,7 +3271,7 @@ app.post(
     const { clienteId, fechaVencimiento, items, pagoInicial } = req.body as {
       clienteId?: number
       fechaVencimiento?: string
-      items?: Array<{ productoId: number; cantidad: number; precioVenta: number }>
+      items?: Array<{ productoId: number; cantidad: number; precioVenta: number; varianteId?: number | null }>
       pagoInicial?: { monto: number; metodoPago: string; referencia?: string; notas?: string } | null
     }
 
