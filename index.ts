@@ -1,5 +1,8 @@
+/// <reference path="./pdfkit.d.ts" />
 import express from 'express'
 import cors from 'cors'
+import ExcelJS from 'exceljs'
+import PDFDocument from 'pdfkit'
 import { apiReference } from '@scalar/express-api-reference'
 import { config } from './config.js'
 import { testConnection, getPool, sql } from './db.js'
@@ -2773,6 +2776,306 @@ app.get(
   },
 )
 
+// ==========================
+// REPORTES
+// ==========================
+
+const UMBRAL_STOCK_BAJO_DEFAULT = 5
+
+// Reporte: productos con stock bajo o sin stock (JSON)
+app.get(
+  '/reportes/stock-bajo',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const umbral = Math.min(Math.max(Number(req.query.umbral) || UMBRAL_STOCK_BAJO_DEFAULT, 0), 100)
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('tiendaId', req.user.tiendaId)
+        .input('umbral', umbral)
+        .query(`
+          SELECT
+            p.Id,
+            p.Nombre,
+            p.CodigoInterno,
+            p.CodigoBarras,
+            p.StockActual,
+            c.Nombre AS CategoriaNombre,
+            pr.Nombre AS ProveedorNombre
+          FROM Productos p
+          LEFT JOIN Categorias c ON p.Categoria_Id = c.Id
+          LEFT JOIN Proveedores pr ON p.Proveedor_Id = pr.Id
+          WHERE p.Tienda_Id = @tiendaId
+            AND (p.StockActual <= @umbral OR p.StockActual IS NULL)
+          ORDER BY p.StockActual ASC, p.Nombre
+        `)
+      return res.json(result.recordset)
+    } catch (error) {
+      console.error('[GET /reportes/stock-bajo] Error', error)
+      return res.status(500).json({ message: 'Error al generar reporte' })
+    }
+  },
+)
+
+// Reporte: productos con stock bajo - Excel
+app.get(
+  '/reportes/stock-bajo/excel',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const umbral = Math.min(Math.max(Number(req.query.umbral) || UMBRAL_STOCK_BAJO_DEFAULT, 0), 100)
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('tiendaId', req.user.tiendaId)
+        .input('umbral', umbral)
+        .query(`
+          SELECT p.Id, p.Nombre, p.CodigoInterno, p.CodigoBarras, p.StockActual,
+            c.Nombre AS CategoriaNombre, pr.Nombre AS ProveedorNombre
+          FROM Productos p
+          LEFT JOIN Categorias c ON p.Categoria_Id = c.Id
+          LEFT JOIN Proveedores pr ON p.Proveedor_Id = pr.Id
+          WHERE p.Tienda_Id = @tiendaId AND (p.StockActual <= @umbral OR p.StockActual IS NULL)
+          ORDER BY p.StockActual ASC, p.Nombre
+        `)
+      const rows = result.recordset as Array<{ Id: number; Nombre: string; CodigoInterno: string; CodigoBarras: string | null; StockActual: number | null; CategoriaNombre: string | null; ProveedorNombre: string | null }>
+      const workbook = new ExcelJS.Workbook()
+      const sheet = workbook.addWorksheet('Stock bajo')
+      sheet.columns = [
+        { header: 'ID', key: 'id', width: 8 },
+        { header: 'Producto', key: 'nombre', width: 35 },
+        { header: 'Código', key: 'codigo', width: 16 },
+        { header: 'Stock actual', key: 'stock', width: 14 },
+        { header: 'Categoría', key: 'categoria', width: 20 },
+        { header: 'Proveedor', key: 'proveedor', width: 22 },
+      ]
+      sheet.getRow(1).font = { bold: true }
+      for (const r of rows) {
+        sheet.addRow({
+          id: r.Id,
+          nombre: r.Nombre,
+          codigo: r.CodigoInterno,
+          stock: r.StockActual ?? 0,
+          categoria: r.CategoriaNombre ?? '',
+          proveedor: r.ProveedorNombre ?? '',
+        })
+      }
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+      res.setHeader('Content-Disposition', `attachment; filename="reporte_stock_bajo_${new Date().toISOString().slice(0, 10)}.xlsx"`)
+      await workbook.xlsx.write(res)
+    } catch (error) {
+      console.error('[GET /reportes/stock-bajo/excel] Error', error)
+      return res.status(500).json({ message: 'Error al exportar Excel' })
+    }
+  },
+)
+
+// Reporte: apartados por vencer (JSON)
+app.get(
+  '/reportes/apartados-por-vencer',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const dias = Math.min(Math.max(Number(req.query.dias) || 30, 1), 90)
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('tiendaId', req.user.tiendaId)
+        .input('dias', dias)
+        .query(`
+          SELECT
+            a.Id,
+            a.FechaCreacion,
+            a.FechaVencimiento,
+            a.Total,
+            a.Abonado,
+            a.Saldo,
+            a.Estado,
+            c.Nombre AS ClienteNombre,
+            c.Cedula AS ClienteCedula,
+            c.Celular AS ClienteCelular
+          FROM Apartados a
+          INNER JOIN Clientes c ON a.Cliente_Id = c.Id
+          WHERE a.Tienda_Id = @tiendaId
+            AND a.Estado = 'Pendiente'
+            AND a.FechaVencimiento >= CAST(GETDATE() AS DATE)
+            AND a.FechaVencimiento <= DATEADD(DAY, @dias, CAST(GETDATE() AS DATE))
+          ORDER BY a.FechaVencimiento ASC, a.Id
+        `)
+      return res.json(result.recordset)
+    } catch (error) {
+      console.error('[GET /reportes/apartados-por-vencer] Error', error)
+      return res.status(500).json({ message: 'Error al generar reporte' })
+    }
+  },
+)
+
+// Reporte: apartados por vencer - Excel
+app.get(
+  '/reportes/apartados-por-vencer/excel',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const dias = Math.min(Math.max(Number(req.query.dias) || 30, 1), 90)
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('tiendaId', req.user.tiendaId)
+        .input('dias', dias)
+        .query(`
+          SELECT a.Id, a.FechaCreacion, a.FechaVencimiento, a.Total, a.Abonado, a.Saldo, a.Estado,
+            c.Nombre AS ClienteNombre, c.Cedula AS ClienteCedula, c.Celular AS ClienteCelular
+          FROM Apartados a
+          INNER JOIN Clientes c ON a.Cliente_Id = c.Id
+          WHERE a.Tienda_Id = @tiendaId AND a.Estado = 'Pendiente'
+            AND a.FechaVencimiento >= CAST(GETDATE() AS DATE)
+            AND a.FechaVencimiento <= DATEADD(DAY, @dias, CAST(GETDATE() AS DATE))
+          ORDER BY a.FechaVencimiento ASC, a.Id
+        `)
+      const rows = result.recordset as Array<{ Id: number; FechaCreacion: Date; FechaVencimiento: Date; Total: number; Abonado: number; Saldo: number; Estado: string; ClienteNombre: string; ClienteCedula: string; ClienteCelular: string | null }>
+      const workbook = new ExcelJS.Workbook()
+      const sheet = workbook.addWorksheet('Apartados por vencer')
+      sheet.columns = [
+        { header: 'ID', key: 'id', width: 8 },
+        { header: 'Cliente', key: 'cliente', width: 28 },
+        { header: 'Cédula', key: 'cedula', width: 14 },
+        { header: 'Celular', key: 'celular', width: 14 },
+        { header: 'Vencimiento', key: 'vencimiento', width: 14 },
+        { header: 'Total', key: 'total', width: 14 },
+        { header: 'Abonado', key: 'abonado', width: 14 },
+        { header: 'Saldo', key: 'saldo', width: 14 },
+      ]
+      sheet.getRow(1).font = { bold: true }
+      for (const r of rows) {
+        sheet.addRow({
+          id: r.Id,
+          cliente: r.ClienteNombre,
+          cedula: r.ClienteCedula,
+          celular: r.ClienteCelular ?? '',
+          vencimiento: r.FechaVencimiento ? new Date(r.FechaVencimiento).toLocaleDateString('es-CO') : '',
+          total: r.Total,
+          abonado: r.Abonado,
+          saldo: r.Saldo,
+        })
+      }
+      if (rows.length > 0) {
+        const tr = sheet.addRow({})
+        tr.getCell(6).value = { formula: `SUM(F2:F${rows.length + 1})` }
+        tr.getCell(7).value = { formula: `SUM(G2:G${rows.length + 1})` }
+        tr.getCell(8).value = { formula: `SUM(H2:H${rows.length + 1})` }
+        tr.font = { bold: true }
+      }
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+      res.setHeader('Content-Disposition', `attachment; filename="reporte_apartados_por_vencer_${new Date().toISOString().slice(0, 10)}.xlsx"`)
+      await workbook.xlsx.write(res)
+    } catch (error) {
+      console.error('[GET /reportes/apartados-por-vencer/excel] Error', error)
+      return res.status(500).json({ message: 'Error al exportar Excel' })
+    }
+  },
+)
+
+// Reporte: productos más vendidos (JSON) - límite mayor para reportes
+app.get(
+  '/reportes/productos-mas-vendidos',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const limit = Math.min(Number(req.query.limit) || 100, 500)
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('tiendaId', sql.UniqueIdentifier, req.user.tiendaId)
+        .input('limit', sql.Int, limit)
+        .query(`
+          SELECT TOP (@limit)
+            p.Id AS Producto_Id,
+            p.Nombre AS ProductoNombre,
+            p.CodigoInterno,
+            SUM(d.Cantidad) AS TotalVendido,
+            SUM(d.Cantidad * d.PrecioUnitario) AS Ingresos
+          FROM Venta_Detalle d
+          INNER JOIN Ventas v ON d.Venta_Id = v.Id
+          INNER JOIN Productos p ON d.Producto_Id = p.Id
+          WHERE v.Tienda_Id = @tiendaId
+          GROUP BY p.Id, p.Nombre, p.CodigoInterno
+          ORDER BY SUM(d.Cantidad) DESC
+        `)
+      return res.json(result.recordset)
+    } catch (error) {
+      console.error('[GET /reportes/productos-mas-vendidos] Error', error)
+      return res.status(500).json({ message: 'Error al generar reporte' })
+    }
+  },
+)
+
+// Reporte: productos más vendidos - Excel
+app.get(
+  '/reportes/productos-mas-vendidos/excel',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const limit = Math.min(Number(req.query.limit) || 100, 500)
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('tiendaId', sql.UniqueIdentifier, req.user.tiendaId)
+        .input('limit', sql.Int, limit)
+        .query(`
+          SELECT TOP (@limit)
+            p.Id AS Producto_Id, p.Nombre AS ProductoNombre, p.CodigoInterno,
+            SUM(d.Cantidad) AS TotalVendido,
+            SUM(d.Cantidad * d.PrecioUnitario) AS Ingresos
+          FROM Venta_Detalle d
+          INNER JOIN Ventas v ON d.Venta_Id = v.Id
+          INNER JOIN Productos p ON d.Producto_Id = p.Id
+          WHERE v.Tienda_Id = @tiendaId
+          GROUP BY p.Id, p.Nombre, p.CodigoInterno
+          ORDER BY SUM(d.Cantidad) DESC
+        `)
+      const rows = result.recordset as Array<{ Producto_Id: number; ProductoNombre: string; CodigoInterno: string; TotalVendido: number; Ingresos: number }>
+      const workbook = new ExcelJS.Workbook()
+      const sheet = workbook.addWorksheet('Productos más vendidos')
+      sheet.columns = [
+        { header: 'ID', key: 'id', width: 8 },
+        { header: 'Producto', key: 'nombre', width: 35 },
+        { header: 'Código', key: 'codigo', width: 16 },
+        { header: 'Unidades vendidas', key: 'unidades', width: 18 },
+        { header: 'Ingresos', key: 'ingresos', width: 16 },
+      ]
+      sheet.getRow(1).font = { bold: true }
+      for (const r of rows) {
+        sheet.addRow({
+          id: r.Producto_Id,
+          nombre: r.ProductoNombre,
+          codigo: r.CodigoInterno,
+          unidades: r.TotalVendido,
+          ingresos: r.Ingresos,
+        })
+      }
+      if (rows.length > 0) {
+        const tr = sheet.addRow({})
+        tr.getCell(4).value = { formula: `SUM(D2:D${rows.length + 1})` }
+        tr.getCell(5).value = { formula: `SUM(E2:E${rows.length + 1})` }
+        tr.font = { bold: true }
+      }
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+      res.setHeader('Content-Disposition', `attachment; filename="reporte_productos_mas_vendidos_${new Date().toISOString().slice(0, 10)}.xlsx"`)
+      await workbook.xlsx.write(res)
+    } catch (error) {
+      console.error('[GET /reportes/productos-mas-vendidos/excel] Error', error)
+      return res.status(500).json({ message: 'Error al exportar Excel' })
+    }
+  },
+)
+
 // Listar ventas de la tienda actual (resumen)
 app.get(
   '/ventas',
@@ -2842,6 +3145,246 @@ app.get(
     } catch (error) {
       console.error('[GET /ventas] Error', error)
       return res.status(500).json({ message: 'Error al obtener ventas' })
+    }
+  },
+)
+
+// Exportar ventas a Excel
+app.get(
+  '/ventas/export/excel',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const { desde, hasta } = req.query as { desde?: string; hasta?: string }
+    let desdeDate: Date | null = null
+    let hastaDate: Date | null = null
+    if (desde) { const d = new Date(desde); if (!Number.isNaN(d.getTime())) desdeDate = d }
+    if (hasta) { const d = new Date(hasta); if (!Number.isNaN(d.getTime())) hastaDate = d }
+    try {
+      const pool = await getPool()
+      const result = await pool.request()
+        .input('tiendaId', req.user.tiendaId)
+        .input('desde', desdeDate)
+        .input('hasta', hastaDate)
+        .query(`
+          SELECT v.Id, v.Fecha, v.TipoVenta, v.TipoEntrega, v.MetodoPago,
+            v.Subtotal, v.DescuentoTotal, v.Total, v.Estado,
+            c.Nombre AS ClienteNombre, r.Nombre AS RepartidorNombre
+          FROM Ventas v
+          INNER JOIN Clientes c ON v.Cliente_Id = c.Id
+          LEFT JOIN Repartidores r ON v.Repartidor_Id = r.Id
+          WHERE v.Tienda_Id = @tiendaId
+            AND (@desde IS NULL OR v.Fecha >= @desde)
+            AND (@hasta IS NULL OR v.Fecha < DATEADD(DAY, 1, @hasta))
+          ORDER BY v.Fecha DESC, v.Id DESC
+        `)
+      const ventas = result.recordset as Array<{
+        Id: number; Fecha: Date; TipoVenta: string | null; TipoEntrega: string | null;
+        MetodoPago: string | null; Subtotal: number; DescuentoTotal: number; Total: number;
+        Estado: string | null; ClienteNombre: string; RepartidorNombre: string | null
+      }>
+      const workbook = new ExcelJS.Workbook()
+      const sheet = workbook.addWorksheet('Ventas')
+      sheet.columns = [
+        { header: 'ID', key: 'id', width: 8 },
+        { header: 'Fecha', key: 'fecha', width: 20 },
+        { header: 'Cliente', key: 'cliente', width: 25 },
+        { header: 'Tipo', key: 'tipo', width: 12 },
+        { header: 'Entrega', key: 'entrega', width: 12 },
+        { header: 'Pago', key: 'pago', width: 14 },
+        { header: 'Subtotal', key: 'subtotal', width: 14 },
+        { header: 'Descuento', key: 'descuento', width: 12 },
+        { header: 'Total', key: 'total', width: 14 },
+        { header: 'Estado', key: 'estado', width: 12 },
+      ]
+      sheet.getRow(1).font = { bold: true }
+      for (const v of ventas) {
+        sheet.addRow({
+          id: v.Id,
+          fecha: v.Fecha ? new Date(v.Fecha).toLocaleString('es-CO') : '',
+          cliente: v.ClienteNombre,
+          tipo: v.TipoVenta ?? '',
+          entrega: v.TipoEntrega ?? '',
+          pago: v.MetodoPago ?? '',
+          subtotal: v.Subtotal,
+          descuento: v.DescuentoTotal ?? 0,
+          total: v.Total,
+          estado: v.Estado ?? '',
+        })
+      }
+      if (ventas.length > 0) {
+        const tr = sheet.addRow({})
+        tr.getCell(7).value = { formula: `SUM(G2:G${ventas.length + 1})` }
+        tr.getCell(9).value = { formula: `SUM(I2:I${ventas.length + 1})` }
+        tr.font = { bold: true }
+      }
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+      res.setHeader('Content-Disposition', `attachment; filename="ventas_${new Date().toISOString().slice(0, 10)}.xlsx"`)
+      await workbook.xlsx.write(res)
+    } catch (error) {
+      console.error('[GET /ventas/export/excel] Error', error)
+      return res.status(500).json({ message: 'Error al exportar a Excel' })
+    }
+  },
+)
+
+// Exportar ventas a PDF
+app.get(
+  '/ventas/export/pdf',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const { desde, hasta } = req.query as { desde?: string; hasta?: string }
+    let desdeDate: Date | null = null
+    let hastaDate: Date | null = null
+    if (desde) { const d = new Date(desde); if (!Number.isNaN(d.getTime())) desdeDate = d }
+    if (hasta) { const d = new Date(hasta); if (!Number.isNaN(d.getTime())) hastaDate = d }
+    try {
+      const pool = await getPool()
+
+      const tiendaRes = await pool.request()
+        .input('tiendaId', req.user.tiendaId)
+        .query(`SELECT NombreComercial, EmailContacto FROM Tiendas WHERE Id = @tiendaId`)
+      const tienda = tiendaRes.recordset[0] as { NombreComercial: string; EmailContacto: string } | undefined
+
+      const result = await pool.request()
+        .input('tiendaId', req.user.tiendaId)
+        .input('desde', desdeDate)
+        .input('hasta', hastaDate)
+        .query(`
+          SELECT v.Id, v.Fecha, v.TipoVenta, v.MetodoPago, v.Subtotal, v.Total,
+            c.Nombre AS ClienteNombre
+          FROM Ventas v
+          INNER JOIN Clientes c ON v.Cliente_Id = c.Id
+          WHERE v.Tienda_Id = @tiendaId
+            AND (@desde IS NULL OR v.Fecha >= @desde)
+            AND (@hasta IS NULL OR v.Fecha < DATEADD(DAY, 1, @hasta))
+          ORDER BY v.Fecha DESC, v.Id DESC
+        `)
+      const ventas = result.recordset as Array<{
+        Id: number; Fecha: Date; TipoVenta: string | null; MetodoPago: string | null;
+        Subtotal: number; Total: number; ClienteNombre: string
+      }>
+
+      const doc = new PDFDocument({ margin: 40, size: 'A4' })
+      res.setHeader('Content-Type', 'application/pdf')
+      res.setHeader('Content-Disposition', `attachment; filename="ventas_${new Date().toISOString().slice(0, 10)}.pdf"`)
+      doc.pipe(res)
+
+      const fmtNum = (n: number) => n.toLocaleString('es-CO', { maximumFractionDigits: 0 })
+      const fmtFecha = (d: Date) => {
+        if (!d) return ''
+        const dt = new Date(d)
+        const day = String(dt.getDate()).padStart(2, '0')
+        const month = String(dt.getMonth() + 1).padStart(2, '0')
+        const year = dt.getFullYear()
+        const h = dt.getHours()
+        const m = String(dt.getMinutes()).padStart(2, '0')
+        return `${day}/${month}/${year} ${h}:${m}`
+      }
+
+      const pageW = doc.page.width
+      const margin = 50
+      const tableLeft = margin
+
+      // ─── Encabezado profesional ───
+      doc.rect(0, 0, pageW, 100).fill('#1e293b')
+      doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(22)
+      doc.text(tienda?.NombreComercial ?? 'Mi Tienda', margin, 25, { width: pageW - margin * 2, align: 'left' })
+      doc.font('Helvetica').fontSize(10)
+      doc.text(tienda?.EmailContacto ?? '', margin, 52, { width: pageW - margin * 2 })
+      doc.font('Helvetica-Bold').fontSize(14)
+      doc.text('Reporte de Ventas', margin, 72, { width: pageW - margin * 2 })
+      doc.fillColor('#000000')
+
+      let y = 115
+      const rango = desdeDate || hastaDate
+        ? `${desdeDate ? new Date(desdeDate).toLocaleDateString('es-CO') : '...'} - ${hastaDate ? new Date(hastaDate).toLocaleDateString('es-CO') : '...'}`
+        : 'Todo el historial'
+      doc.font('Helvetica').fontSize(10)
+      doc.fillColor('#64748b')
+      doc.text(`Período: ${rango}`, margin, y)
+      doc.text(`Generado: ${new Date().toLocaleString('es-CO')}`, margin, y + 14)
+      doc.fillColor('#000000')
+      y += 38
+
+      // ─── Tabla: columnas más anchas para evitar superposición ───
+      const colWidths = [32, 95, 120, 55, 70, 70]
+      const totalColWidth = colWidths.reduce((a, b) => a + b, 0)
+      const headers = ['ID', 'Fecha', 'Cliente', 'Tipo', 'Subtotal', 'Total']
+      const lineHeight = 14
+      const rowPadding = 10
+
+      doc.font('Helvetica-Bold').fontSize(9)
+      doc.rect(tableLeft, y, totalColWidth, lineHeight + 8).fill('#f1f5f9')
+      doc.fillColor('#334155')
+      headers.forEach((h, i) => {
+        const x = tableLeft + colWidths.slice(0, i).reduce((a, b) => a + b, 0) + 4
+        doc.text(h, x, y + 6, { width: colWidths[i] - 8, align: i >= 4 ? 'right' : 'left' })
+      })
+      doc.fillColor('#000000')
+      y += lineHeight + 8 + 4
+
+      doc.moveTo(tableLeft, y).lineTo(tableLeft + totalColWidth, y).stroke()
+      y += rowPadding
+
+      doc.font('Helvetica').fontSize(9)
+      let totalG = 0
+
+      for (const v of ventas) {
+        if (y > 720) {
+          doc.addPage()
+          doc.rect(0, 0, pageW, 45).fill('#1e293b')
+          doc.fillColor('#ffffff').font('Helvetica').fontSize(9)
+          doc.text(`${tienda?.NombreComercial ?? 'Mi Tienda'} - Reporte de Ventas (continuación)`, margin, 18)
+          doc.fillColor('#000000')
+          y = 55
+        }
+
+        const rowCells = [
+          String(v.Id),
+          fmtFecha(v.Fecha),
+          (v.ClienteNombre ?? '').trim(),
+          (v.TipoVenta ?? '—').trim(),
+          fmtNum(v.Subtotal),
+          fmtNum(v.Total),
+        ]
+
+        let rowHeight = lineHeight
+        for (let i = 0; i < rowCells.length; i++) {
+          const h = doc.heightOfString(rowCells[i], { width: colWidths[i] - 8 })
+          if (h > rowHeight) rowHeight = h
+        }
+        rowHeight = Math.max(rowHeight + 4, lineHeight + 6)
+
+        for (let i = 0; i < rowCells.length; i++) {
+          const x = tableLeft + colWidths.slice(0, i).reduce((a, b) => a + b, 0) + 4
+          doc.text(rowCells[i], x, y + 4, {
+            width: colWidths[i] - 8,
+            align: i >= 4 ? 'right' : 'left',
+          })
+        }
+        totalG += v.Total
+        y += rowHeight
+      }
+
+      doc.moveTo(tableLeft, y).lineTo(tableLeft + totalColWidth, y).stroke()
+      y += 12
+
+      doc.font('Helvetica-Bold').fontSize(10)
+      doc.text(`Total: ${fmtNum(totalG)}`, tableLeft, y)
+      doc.text(`Registros: ${ventas.length}`, tableLeft + totalColWidth - 70, y, { align: 'right', width: 70 })
+      y += 25
+
+      doc.font('Helvetica').fontSize(8)
+      doc.fillColor('#94a3b8')
+      doc.text('Documento generado automáticamente.', margin, y)
+      doc.fillColor('#000000')
+
+      doc.end()
+    } catch (error) {
+      console.error('[GET /ventas/export/pdf] Error', error)
+      return res.status(500).json({ message: 'Error al exportar a PDF' })
     }
   },
 )
@@ -2939,6 +3482,181 @@ app.get(
   },
 )
 
+// Listar devoluciones de una venta
+app.get(
+  '/ventas/:id/devoluciones',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'No autorizado' })
+    }
+
+    const { id } = req.params
+    const ventaId = Number(id)
+    if (Number.isNaN(ventaId)) {
+      return res.status(400).json({ message: 'Id de venta inválido' })
+    }
+
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('ventaId', ventaId)
+        .input('tiendaId', req.user.tiendaId)
+        .query(`
+          SELECT
+            m.Id,
+            m.Fecha,
+            m.TipoMovimiento,
+            m.Cantidad,
+            m.Motivo,
+            m.Producto_Id,
+            p.Nombre AS ProductoNombre,
+            p.CodigoInterno,
+            p.CodigoBarras,
+            img.Url AS ImagenUrl,
+            m.Variacion_Id AS Variante_Id,
+            v.Atributo AS VarianteAtributo,
+            v.Valor AS VarianteValor,
+            v.CodigoSKU AS VarianteCodigoSKU
+          FROM Movimientos_Inventario m
+          INNER JOIN Productos p ON m.Producto_Id = p.Id
+          LEFT JOIN Producto_Variaciones v ON m.Variacion_Id = v.Id
+          OUTER APPLY (
+            SELECT TOP 1 Url FROM Producto_Imagenes
+            WHERE Producto_Id = p.Id AND EsPrincipal = 1 ORDER BY Id
+          ) img
+          WHERE m.Venta_Id = @ventaId AND m.Tienda_Id = @tiendaId AND m.TipoMovimiento = 'DEVOLUCION'
+          ORDER BY m.Fecha DESC, m.Id DESC
+        `)
+
+      return res.json(result.recordset)
+    } catch (error) {
+      console.error('[GET /ventas/:id/devoluciones] Error', error)
+      return res.status(500).json({ message: 'Error al obtener devoluciones' })
+    }
+  },
+)
+
+// Registrar devolución parcial o total de una venta
+app.post(
+  '/ventas/:id/devolucion',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'No autorizado' })
+    }
+
+    const { id } = req.params
+    const { items, motivo } = req.body as {
+      items?: Array<{ productoId: number; varianteId?: number | null; cantidad: number }>
+      motivo?: string
+    }
+
+    const ventaId = Number(id)
+    if (Number.isNaN(ventaId)) {
+      return res.status(400).json({ message: 'Id de venta inválido' })
+    }
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: 'Debe indicar al menos un ítem a devolver' })
+    }
+
+    try {
+      const pool = await getPool()
+      const tx = new sql.Transaction(pool)
+      await tx.begin()
+
+      try {
+        const detalleRes = await new sql.Request(tx)
+          .input('ventaId', ventaId)
+          .input('tiendaId', req.user.tiendaId)
+          .query(`
+            SELECT v.Id FROM Ventas v
+            WHERE v.Id = @ventaId AND v.Tienda_Id = @tiendaId AND v.Estado <> 'Cancelado'
+          `)
+        if (!detalleRes.recordset.length) {
+          await tx.rollback()
+          return res.status(404).json({ message: 'Venta no encontrada o ya cancelada' })
+        }
+
+        const ventaDetalle = await new sql.Request(tx)
+          .input('ventaId', ventaId)
+          .query(`SELECT Producto_Id, Variante_Id, Cantidad FROM Venta_Detalle WHERE Venta_Id = @ventaId`)
+        const detalleMap = new Map<string, { cantidad: number }>()
+        for (const d of ventaDetalle.recordset as { Producto_Id: number; Variante_Id: number | null; Cantidad: number }[]) {
+          const k = `${d.Producto_Id}-${d.Variante_Id ?? 'base'}`
+          const prev = detalleMap.get(k)
+          detalleMap.set(k, { cantidad: (prev?.cantidad ?? 0) + d.Cantidad })
+        }
+
+        const devolucionesPrev = await new sql.Request(tx)
+          .input('ventaId', ventaId)
+          .query(`
+            SELECT Producto_Id, Variacion_Id, SUM(Cantidad) AS TotalDev
+            FROM Movimientos_Inventario
+            WHERE Venta_Id = @ventaId AND TipoMovimiento = 'DEVOLUCION'
+            GROUP BY Producto_Id, Variacion_Id
+          `)
+        const devMap = new Map<string, number>()
+        for (const r of devolucionesPrev.recordset as { Producto_Id: number; Variacion_Id: number | null; TotalDev: number }[]) {
+          devMap.set(`${r.Producto_Id}-${r.Variacion_Id ?? 'base'}`, r.TotalDev)
+        }
+
+        for (const it of items) {
+          const varianteId = it.varianteId ?? null
+          const k = `${it.productoId}-${varianteId ?? 'base'}`
+          const vendido = detalleMap.get(k)?.cantidad ?? 0
+          const yaDevuelto = devMap.get(k) ?? 0
+          const maxDevolver = vendido - yaDevuelto
+          if (it.cantidad <= 0 || it.cantidad > maxDevolver) {
+            await tx.rollback()
+            return res.status(400).json({
+              message: `Cantidad inválida para producto ${it.productoId}${varianteId != null ? ` variante ${varianteId}` : ''}. Máximo a devolver: ${maxDevolver}`,
+            })
+          }
+
+          if (varianteId != null) {
+            await new sql.Request(tx)
+              .input('varianteId', varianteId)
+              .input('cantidad', it.cantidad)
+              .query(`UPDATE Producto_Variaciones SET StockActual = ISNULL(StockActual, 0) + @cantidad WHERE Id = @varianteId`)
+          } else {
+            await new sql.Request(tx)
+              .input('productoId', it.productoId)
+              .input('cantidad', it.cantidad)
+              .query(`UPDATE Productos SET StockActual = ISNULL(StockActual, 0) + @cantidad WHERE Id = @productoId`)
+          }
+
+          await new sql.Request(tx)
+            .input('tiendaId', sql.UniqueIdentifier, req.user.tiendaId)
+            .input('productoId', it.productoId)
+            .input('variacionId', varianteId)
+            .input('cantidad', it.cantidad)
+            .input('ventaId', ventaId)
+            .input('motivo', motivo ?? `Devolución venta #${ventaId}`)
+            .query(`
+              INSERT INTO Movimientos_Inventario (Tienda_Id, Producto_Id, Variacion_Id, TipoMovimiento, Cantidad, Motivo, Fecha, Venta_Id)
+              VALUES (@tiendaId, @productoId, @variacionId, 'DEVOLUCION', @cantidad, @motivo, GETDATE(), @ventaId)
+            `)
+
+          const nuevoTotal = (devMap.get(k) ?? 0) + it.cantidad
+          devMap.set(k, nuevoTotal)
+        }
+
+        await tx.commit()
+        return res.status(201).json({ message: 'Devolución registrada correctamente' })
+      } catch (innerErr) {
+        await tx.rollback()
+        throw innerErr
+      }
+    } catch (error) {
+      console.error('[POST /ventas/:id/devolucion] Error', error)
+      return res.status(500).json({ message: 'Error al registrar devolución' })
+    }
+  },
+)
+
 // Listar movimientos de inventario de la tienda actual
 app.get(
   '/movimientos-inventario',
@@ -2990,7 +3708,132 @@ app.get(
   },
 )
 
-// Actualizar cabecera de una venta (tipo, entrega, pago, descuento, observación)
+// Crear movimiento de inventario (ENTRADA, SALIDA, AJUSTE, DEVOLUCION)
+app.post(
+  '/movimientos-inventario',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'No autorizado' })
+    }
+
+    const { tipoMovimiento, productoId, varianteId, cantidad, motivo } = req.body as {
+      tipoMovimiento?: string
+      productoId?: number
+      varianteId?: number | null
+      cantidad?: number
+      motivo?: string
+    }
+
+    const tiposValidos = ['ENTRADA', 'SALIDA', 'AJUSTE', 'DEVOLUCION']
+    if (!tipoMovimiento || !tiposValidos.includes(tipoMovimiento)) {
+      return res.status(400).json({ message: 'Tipo de movimiento inválido. Use: ENTRADA, SALIDA, AJUSTE o DEVOLUCION' })
+    }
+
+    const prodId = Number(productoId)
+    const cant = Number(cantidad)
+    if (Number.isNaN(prodId) || prodId <= 0 || Number.isNaN(cant) || cant <= 0) {
+      return res.status(400).json({ message: 'productoId y cantidad deben ser números positivos' })
+    }
+
+    try {
+      const pool = await getPool()
+      const variacionId = varianteId != null ? Number(varianteId) : null
+
+      const tx = new sql.Transaction(pool)
+      await tx.begin()
+
+      try {
+        const reqTx = new sql.Request(tx)
+        if (tipoMovimiento === 'SALIDA') {
+          const stockRes = await reqTx
+            .input('productoId', prodId)
+            .input('variacionId', variacionId)
+            .query(`
+              SELECT ISNULL(p.StockActual, 0) AS StockProducto,
+                     ISNULL(v.StockActual, 0) AS StockVariante
+              FROM Productos p
+              LEFT JOIN Producto_Variaciones v ON v.Producto_Id = p.Id AND v.Id = @variacionId
+              WHERE p.Id = @productoId
+            `)
+          const row = stockRes.recordset[0] as { StockProducto: number; StockVariante: number } | undefined
+          const stockDisponible = variacionId != null
+            ? (row?.StockVariante ?? 0)
+            : (row?.StockProducto ?? 0)
+          if (stockDisponible < cant) {
+            await tx.rollback()
+            return res.status(400).json({
+              message: `Stock insuficiente. Disponible: ${stockDisponible}`,
+              stockDisponible,
+            })
+          }
+        }
+
+        if (tipoMovimiento === 'ENTRADA' || tipoMovimiento === 'DEVOLUCION') {
+          if (variacionId != null) {
+            await new sql.Request(tx)
+              .input('variacionId', variacionId)
+              .input('cantidad', cant)
+              .query(`UPDATE Producto_Variaciones SET StockActual = ISNULL(StockActual, 0) + @cantidad WHERE Id = @variacionId`)
+          } else {
+            await new sql.Request(tx)
+              .input('productoId', prodId)
+              .input('cantidad', cant)
+              .query(`UPDATE Productos SET StockActual = ISNULL(StockActual, 0) + @cantidad WHERE Id = @productoId`)
+          }
+        } else if (tipoMovimiento === 'SALIDA') {
+          if (variacionId != null) {
+            await new sql.Request(tx)
+              .input('variacionId', variacionId)
+              .input('cantidad', cant)
+              .query(`UPDATE Producto_Variaciones SET StockActual = ISNULL(StockActual, 0) - @cantidad WHERE Id = @variacionId`)
+          } else {
+            await new sql.Request(tx)
+              .input('productoId', prodId)
+              .input('cantidad', cant)
+              .query(`UPDATE Productos SET StockActual = ISNULL(StockActual, 0) - @cantidad WHERE Id = @productoId`)
+          }
+        } else if (tipoMovimiento === 'AJUSTE') {
+          if (variacionId != null) {
+            await new sql.Request(tx)
+              .input('variacionId', variacionId)
+              .input('cantidad', cant)
+              .query(`UPDATE Producto_Variaciones SET StockActual = ISNULL(StockActual, 0) + @cantidad WHERE Id = @variacionId`)
+          } else {
+            await new sql.Request(tx)
+              .input('productoId', prodId)
+              .input('cantidad', cant)
+              .query(`UPDATE Productos SET StockActual = ISNULL(StockActual, 0) + @cantidad WHERE Id = @productoId`)
+          }
+        }
+
+        await new sql.Request(tx)
+          .input('tiendaId', sql.UniqueIdentifier, req.user.tiendaId)
+          .input('productoId', prodId)
+          .input('variacionId', variacionId)
+          .input('tipoMovimiento', tipoMovimiento)
+          .input('cantidad', cant)
+          .input('motivo', motivo ?? null)
+          .query(`
+            INSERT INTO Movimientos_Inventario (Tienda_Id, Producto_Id, Variacion_Id, TipoMovimiento, Cantidad, Motivo, Fecha)
+            VALUES (@tiendaId, @productoId, @variacionId, @tipoMovimiento, @cantidad, @motivo, GETDATE())
+          `)
+
+        await tx.commit()
+        return res.status(201).json({ message: 'Movimiento registrado correctamente' })
+      } catch (innerErr) {
+        await tx.rollback()
+        throw innerErr
+      }
+    } catch (error) {
+      console.error('[POST /movimientos-inventario] Error', error)
+      return res.status(500).json({ message: 'Error al registrar movimiento de inventario' })
+    }
+  },
+)
+
+// Actualizar cabecera de una venta (tipo, entrega, pago, descuento, observación, estado)
+// Si estado cambia a Cancelado: anulación formal (restaurar stock + registrar DEVOLUCION)
 app.put(
   '/ventas/:id',
   authMiddleware,
@@ -3016,6 +3859,53 @@ app.put(
       }
 
       const pool = await getPool()
+
+      if (estado === 'Cancelado') {
+        const tx = new sql.Transaction(pool)
+        await tx.begin()
+        try {
+          const estadoActual = await new sql.Request(tx)
+            .input('ventaId', ventaId)
+            .input('tiendaId', req.user.tiendaId)
+            .query(`SELECT Estado FROM Ventas WHERE Id = @ventaId AND Tienda_Id = @tiendaId`)
+          const currentEstado = (estadoActual.recordset[0] as { Estado: string } | undefined)?.Estado
+          if (currentEstado !== 'Cancelado') {
+            const detalleRes = await new sql.Request(tx)
+              .input('ventaId', ventaId)
+              .query(`SELECT Producto_Id, Variante_Id, Cantidad FROM Venta_Detalle WHERE Venta_Id = @ventaId`)
+            const items = detalleRes.recordset as { Producto_Id: number; Variante_Id: number | null; Cantidad: number }[]
+            for (const it of items) {
+              await new sql.Request(tx)
+                .input('productoId', sql.Int, it.Producto_Id)
+                .input('cantidad', sql.Int, it.Cantidad)
+                .query(`UPDATE Productos SET StockActual = ISNULL(StockActual, 0) + @cantidad WHERE Id = @productoId`)
+              if (it.Variante_Id != null) {
+                await new sql.Request(tx)
+                  .input('varianteId', sql.Int, it.Variante_Id)
+                  .input('cantidad', sql.Int, it.Cantidad)
+                  .query(`UPDATE Producto_Variaciones SET StockActual = ISNULL(StockActual, 0) + @cantidad WHERE Id = @varianteId`)
+              }
+              await new sql.Request(tx)
+                .input('tiendaId', sql.UniqueIdentifier, req.user.tiendaId)
+                .input('productoId', sql.Int, it.Producto_Id)
+                .input('variacionId', sql.Int, it.Variante_Id ?? null)
+                .input('cantidad', sql.Int, it.Cantidad)
+                .input('motivo', sql.NVarChar, `Anulación venta #${ventaId}`)
+                .query(`
+                  INSERT INTO Movimientos_Inventario (Tienda_Id, Producto_Id, Variacion_Id, TipoMovimiento, Cantidad, Motivo, Fecha)
+                  VALUES (@tiendaId, @productoId, @variacionId, 'DEVOLUCION', @cantidad, @motivo, GETDATE())
+                `)
+            }
+            await tx.commit()
+          } else {
+            await tx.rollback()
+          }
+        } catch (innerErr) {
+          await tx.rollback()
+          throw innerErr
+        }
+      }
+
       const request = pool
         .request()
         .input('id', ventaId)
@@ -3115,7 +4005,7 @@ app.put(
   },
 )
 
-// Eliminar una venta (cabecera + detalle)
+// Eliminar una venta (restaurar stock, registrar DEVOLUCION, luego eliminar cabecera + detalle)
 app.delete(
   '/ventas/:id',
   authMiddleware,
@@ -3137,16 +4027,41 @@ app.delete(
       await tx.begin()
 
       try {
-        const reqTx = new sql.Request(tx)
-        reqTx.input('id', ventaId).input('tiendaId', req.user.tiendaId)
+        const detalleRes = await new sql.Request(tx)
+          .input('ventaId', ventaId)
+          .query(`SELECT Producto_Id, Variante_Id, Cantidad FROM Venta_Detalle WHERE Venta_Id = @ventaId`)
+        const items = detalleRes.recordset as { Producto_Id: number; Variante_Id: number | null; Cantidad: number }[]
 
-        await reqTx.query(`
-          DELETE FROM Venta_Detalle
-          WHERE Venta_Id = @id;
+        for (const it of items) {
+          await new sql.Request(tx)
+            .input('productoId', sql.Int, it.Producto_Id)
+            .input('cantidad', sql.Int, it.Cantidad)
+            .query(`UPDATE Productos SET StockActual = ISNULL(StockActual, 0) + @cantidad WHERE Id = @productoId`)
+          if (it.Variante_Id != null) {
+            await new sql.Request(tx)
+              .input('varianteId', sql.Int, it.Variante_Id)
+              .input('cantidad', sql.Int, it.Cantidad)
+              .query(`UPDATE Producto_Variaciones SET StockActual = ISNULL(StockActual, 0) + @cantidad WHERE Id = @varianteId`)
+          }
+          await new sql.Request(tx)
+            .input('tiendaId', sql.UniqueIdentifier, req.user.tiendaId)
+            .input('productoId', sql.Int, it.Producto_Id)
+            .input('variacionId', sql.Int, it.Variante_Id ?? null)
+            .input('cantidad', sql.Int, it.Cantidad)
+            .input('motivo', sql.NVarChar, `Anulación venta #${ventaId}`)
+            .query(`
+              INSERT INTO Movimientos_Inventario (Tienda_Id, Producto_Id, Variacion_Id, TipoMovimiento, Cantidad, Motivo, Fecha)
+              VALUES (@tiendaId, @productoId, @variacionId, 'DEVOLUCION', @cantidad, @motivo, GETDATE())
+            `)
+        }
 
-          DELETE FROM Ventas
-          WHERE Id = @id AND Tienda_Id = @tiendaId;
-        `)
+        await new sql.Request(tx)
+          .input('id', ventaId)
+          .input('tiendaId', req.user.tiendaId)
+          .query(`
+            DELETE FROM Venta_Detalle WHERE Venta_Id = @id;
+            DELETE FROM Ventas WHERE Id = @id AND Tienda_Id = @tiendaId;
+          `)
 
         await tx.commit()
       } catch (innerErr) {
