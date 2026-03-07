@@ -4600,7 +4600,7 @@ app.get('/public/tiendas/:slug/categorias', async (req, res) => {
 // Listar productos visibles de una tienda
 app.get('/public/tiendas/:slug/productos', async (req, res) => {
   const { slug } = req.params
-  const { categoria, buscar } = req.query
+  const { categoria, buscar, promocion } = req.query
 
   try {
     const pool = await getPool()
@@ -4688,7 +4688,13 @@ app.get('/public/tiendas/:slug/productos', async (req, res) => {
       }
     }
 
-    res.json(recordset)
+    // Filtrar solo productos con oferta si ?promocion=1
+    let resultado = recordset
+    if (promocion === '1' || promocion === 'true') {
+      resultado = recordset.filter((r) => (r as Record<string, unknown>).TieneOferta === true)
+    }
+
+    res.json(resultado)
   } catch (error) {
     console.error('[GET /public/tiendas/:slug/productos] Error', error)
     res.status(500).json({ message: 'Error al obtener productos' })
