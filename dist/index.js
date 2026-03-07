@@ -1463,7 +1463,7 @@ app.post('/ventas', authMiddleware, async (req, res) => {
                 .input('productoId', it.productoId)
                 .input('tiendaId', req.user.tiendaId)
                 .query(`
-            SELECT Id, PrecioDetal, PrecioMayor, StockActual
+            SELECT Id, Nombre, PrecioDetal, PrecioMayor, StockActual
             FROM Productos
             WHERE Id = @productoId AND Tienda_Id = @tiendaId
           `);
@@ -1474,13 +1474,14 @@ app.post('/ventas', authMiddleware, async (req, res) => {
             productosMap.set(it.productoId, prod);
             let stockDisponible = prod.StockActual ?? 0;
             let precioBase = tipoVentaPrecio === 'MAYORISTA' && prod.PrecioMayor != null ? prod.PrecioMayor : prod.PrecioDetal;
+            let varianteDesc = null;
             if (it.varianteId != null) {
                 const varRes = await pool
                     .request()
                     .input('varianteId', it.varianteId)
                     .input('productoId', it.productoId)
                     .query(`
-              SELECT Id, PrecioAdicional, StockActual, Producto_Id
+              SELECT Id, Atributo, Valor, PrecioAdicional, StockActual, Producto_Id
               FROM Producto_Variaciones
               WHERE Id = @varianteId AND Producto_Id = @productoId
             `);
@@ -1490,11 +1491,23 @@ app.post('/ventas', authMiddleware, async (req, res) => {
                 }
                 variantesMap.set(it.varianteId, vari);
                 stockDisponible = vari.StockActual ?? 0;
+                varianteDesc = `${vari.Atributo}: ${vari.Valor}`;
                 precioBase += vari.PrecioAdicional ?? 0;
             }
             if (stockDisponible < it.cantidad) {
+                const productoNombre = prod.Nombre ?? `Producto #${it.productoId}`;
+                const descripcion = varianteDesc
+                    ? `${productoNombre} (${varianteDesc})`
+                    : productoNombre;
                 return res.status(400).json({
-                    message: `Stock insuficiente para el producto ${it.productoId}${it.varianteId ? ` (variante ${it.varianteId})` : ''}. Disponible: ${stockDisponible}, solicitado: ${it.cantidad}.`,
+                    message: `Stock insuficiente para "${descripcion}". Disponible: ${stockDisponible}, solicitado: ${it.cantidad}.`,
+                    code: 'STOCK_INSUFICIENTE',
+                    productoId: it.productoId,
+                    varianteId: it.varianteId ?? null,
+                    productoNombre,
+                    varianteDesc,
+                    stockDisponible,
+                    cantidadSolicitada: it.cantidad,
                 });
             }
         }
@@ -2132,6 +2145,40 @@ app.post('/clientes/import-excel', authMiddleware, async (req, res) => {
     catch (error) {
         console.error('[POST /clientes/import-excel] Error general', error);
         return res.status(500).json({ message: 'Error al importar clientes desde Excel' });
+    }
+});
+// Top productos más vendidos (para dashboard)
+app.get('/dashboard/top-productos', authMiddleware, async (req, res) => {
+    if (!req.user) {
+        return res.status(401).json({ message: 'No autorizado' });
+    }
+    const limit = Math.min(Number(req.query.limit) || 10, 20);
+    try {
+        const pool = await (0, db_js_1.getPool)();
+        const result = await pool
+            .request()
+            .input('tiendaId', db_js_1.sql.UniqueIdentifier, req.user.tiendaId)
+            .input('limit', db_js_1.sql.Int, limit)
+            .query(`
+          SELECT TOP (@limit)
+            p.Id AS Producto_Id,
+            p.Nombre AS ProductoNombre,
+            p.CodigoInterno,
+            SUM(d.Cantidad) AS TotalVendido,
+            SUM(d.Cantidad * d.PrecioUnitario) AS Ingresos
+          FROM Venta_Detalle d
+          INNER JOIN Ventas v ON d.Venta_Id = v.Id
+          INNER JOIN Productos p ON d.Producto_Id = p.Id
+          WHERE v.Tienda_Id = @tiendaId
+          GROUP BY p.Id, p.Nombre, p.CodigoInterno
+          ORDER BY SUM(d.Cantidad) DESC
+        `);
+        const rows = result.recordset;
+        return res.json(rows);
+    }
+    catch (error) {
+        console.error('[GET /dashboard/top-productos] Error', error);
+        return res.status(500).json({ message: 'Error al obtener top productos' });
     }
 });
 // Listar ventas de la tienda actual (resumen)
@@ -3685,7 +3732,7 @@ app.get('/public/tiendas/:slug/categorias', async (req, res) => {
 // Listar productos visibles de una tienda
 app.get('/public/tiendas/:slug/productos', async (req, res) => {
     const { slug } = req.params;
-    const { categoria, buscar } = req.query;
+    const { categoria, buscar, promocion } = req.query;
     try {
         const pool = await (0, db_js_1.getPool)();
         const request = pool.request().input('slug', slug);
@@ -3763,7 +3810,12 @@ app.get('/public/tiendas/:slug/productos', async (req, res) => {
                 row.TieneOferta = false;
             }
         }
-        res.json(recordset);
+        // Filtrar solo productos con oferta si ?promocion=1
+        let resultado = recordset;
+        if (promocion === '1' || promocion === 'true') {
+            resultado = recordset.filter((r) => r.TieneOferta === true);
+        }
+        res.json(resultado);
     }
     catch (error) {
         console.error('[GET /public/tiendas/:slug/productos] Error', error);
@@ -3877,7 +3929,7 @@ app.post('/public/pedidos', async (req, res) => {
                 .input('productoId', it.productoId)
                 .input('tiendaId', tiendaId)
                 .query(`
-          SELECT Id, PrecioDetal, StockActual
+          SELECT Id, Nombre, PrecioDetal, StockActual
           FROM Productos
           WHERE Id = @productoId AND Tienda_Id = @tiendaId AND Visible = 1
         `);
@@ -3894,7 +3946,7 @@ app.post('/public/pedidos', async (req, res) => {
                     .input('varianteId', it.varianteId)
                     .input('productoId', it.productoId)
                     .query(`
-            SELECT Id, PrecioAdicional, StockActual, Producto_Id
+            SELECT Id, Atributo, Valor, PrecioAdicional, StockActual, Producto_Id
             FROM Producto_Variaciones
             WHERE Id = @varianteId AND Producto_Id = @productoId
           `);
@@ -3907,8 +3959,12 @@ app.post('/public/pedidos', async (req, res) => {
                 precioBase += vari.PrecioAdicional ?? 0;
             }
             if (stockDisponible < it.cantidad) {
+                const productoNombre = prod.Nombre ?? `Producto #${it.productoId}`;
+                const variante = it.varianteId != null ? variantesMap.get(it.varianteId) : undefined;
+                const varianteDesc = variante ? ` (${variante.Atributo}: ${variante.Valor})` : '';
+                const descripcion = `${productoNombre}${varianteDesc}`;
                 return res.status(400).json({
-                    message: `Stock insuficiente para el producto ${it.productoId}${it.varianteId ? ` (variante)` : ''}. Disponible: ${stockDisponible}, solicitado: ${it.cantidad}.`,
+                    message: `Stock insuficiente para "${descripcion}". Disponible: ${stockDisponible}, solicitado: ${it.cantidad}.`,
                 });
             }
         }

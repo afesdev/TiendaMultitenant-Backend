@@ -1861,8 +1861,14 @@ app.post(
       const pool = await getPool()
 
       // Obtener precios base y validar stock antes de la transacción
-      const productosMap = new Map<number, { PrecioDetal: number; PrecioMayor: number | null; StockActual: number }>()
-      const variantesMap = new Map<number, { PrecioAdicional: number; StockActual: number; Producto_Id: number }>()
+      const productosMap = new Map<
+        number,
+        { Nombre: string; PrecioDetal: number; PrecioMayor: number | null; StockActual: number }
+      >()
+      const variantesMap = new Map<
+        number,
+        { Atributo: string; Valor: string; PrecioAdicional: number; StockActual: number; Producto_Id: number }
+      >()
 
       for (const it of items) {
         const prodRes = await pool
@@ -1870,11 +1876,13 @@ app.post(
           .input('productoId', it.productoId)
           .input('tiendaId', req.user.tiendaId)
           .query(`
-            SELECT Id, PrecioDetal, PrecioMayor, StockActual
+            SELECT Id, Nombre, PrecioDetal, PrecioMayor, StockActual
             FROM Productos
             WHERE Id = @productoId AND Tienda_Id = @tiendaId
           `)
-        const prod = prodRes.recordset[0] as { Id: number; PrecioDetal: number; PrecioMayor: number | null; StockActual: number } | undefined
+        const prod = prodRes.recordset[0] as
+          | { Id: number; Nombre: string; PrecioDetal: number; PrecioMayor: number | null; StockActual: number }
+          | undefined
         if (!prod) {
           return res.status(400).json({ message: `Producto ${it.productoId} no encontrado o no pertenece a la tienda.` })
         }
@@ -1882,6 +1890,7 @@ app.post(
 
         let stockDisponible = prod.StockActual ?? 0
         let precioBase = tipoVentaPrecio === 'MAYORISTA' && prod.PrecioMayor != null ? prod.PrecioMayor : prod.PrecioDetal
+        let varianteDesc: string | null = null
 
         if (it.varianteId != null) {
           const varRes = await pool
@@ -1889,22 +1898,36 @@ app.post(
             .input('varianteId', it.varianteId)
             .input('productoId', it.productoId)
             .query(`
-              SELECT Id, PrecioAdicional, StockActual, Producto_Id
+              SELECT Id, Atributo, Valor, PrecioAdicional, StockActual, Producto_Id
               FROM Producto_Variaciones
               WHERE Id = @varianteId AND Producto_Id = @productoId
             `)
-          const vari = varRes.recordset[0] as { PrecioAdicional: number; StockActual: number; Producto_Id: number } | undefined
+          const vari = varRes.recordset[0] as
+            | { Atributo: string; Valor: string; PrecioAdicional: number; StockActual: number; Producto_Id: number }
+            | undefined
           if (!vari) {
             return res.status(400).json({ message: `Variante ${it.varianteId} no encontrada para el producto.` })
           }
           variantesMap.set(it.varianteId, vari)
           stockDisponible = vari.StockActual ?? 0
+          varianteDesc = `${vari.Atributo}: ${vari.Valor}`
           precioBase += vari.PrecioAdicional ?? 0
         }
 
         if (stockDisponible < it.cantidad) {
+          const productoNombre = prod.Nombre ?? `Producto #${it.productoId}`
+          const descripcion = varianteDesc
+            ? `${productoNombre} (${varianteDesc})`
+            : productoNombre
           return res.status(400).json({
-            message: `Stock insuficiente para el producto ${it.productoId}${it.varianteId ? ` (variante ${it.varianteId})` : ''}. Disponible: ${stockDisponible}, solicitado: ${it.cantidad}.`,
+            message: `Stock insuficiente para "${descripcion}". Disponible: ${stockDisponible}, solicitado: ${it.cantidad}.`,
+            code: 'STOCK_INSUFICIENTE',
+            productoId: it.productoId,
+            varianteId: it.varianteId ?? null,
+            productoNombre,
+            varianteDesc,
+            stockDisponible,
+            cantidadSolicitada: it.cantidad,
           })
         }
       }
@@ -2705,6 +2728,47 @@ app.post(
     } catch (error) {
       console.error('[POST /clientes/import-excel] Error general', error)
       return res.status(500).json({ message: 'Error al importar clientes desde Excel' })
+    }
+  },
+)
+
+// Top productos más vendidos (para dashboard)
+app.get(
+  '/dashboard/top-productos',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'No autorizado' })
+    }
+
+    const limit = Math.min(Number(req.query.limit) || 10, 20)
+
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('tiendaId', sql.UniqueIdentifier, req.user.tiendaId)
+        .input('limit', sql.Int, limit)
+        .query(`
+          SELECT TOP (@limit)
+            p.Id AS Producto_Id,
+            p.Nombre AS ProductoNombre,
+            p.CodigoInterno,
+            SUM(d.Cantidad) AS TotalVendido,
+            SUM(d.Cantidad * d.PrecioUnitario) AS Ingresos
+          FROM Venta_Detalle d
+          INNER JOIN Ventas v ON d.Venta_Id = v.Id
+          INNER JOIN Productos p ON d.Producto_Id = p.Id
+          WHERE v.Tienda_Id = @tiendaId
+          GROUP BY p.Id, p.Nombre, p.CodigoInterno
+          ORDER BY SUM(d.Cantidad) DESC
+        `)
+
+      const rows = result.recordset
+      return res.json(rows)
+    } catch (error) {
+      console.error('[GET /dashboard/top-productos] Error', error)
+      return res.status(500).json({ message: 'Error al obtener top productos' })
     }
   },
 )
@@ -4824,8 +4888,8 @@ app.post('/public/pedidos', async (req, res) => {
     const tiendaId = tiendaResult.recordset[0].Id
 
     // 2. Validar productos, stock y calcular precios con promociones
-    const productosMap = new Map<number, { PrecioDetal: number; StockActual: number }>()
-    const variantesMap = new Map<number, { PrecioAdicional: number; StockActual: number; Producto_Id: number }>()
+    const productosMap = new Map<number, { Nombre: string; PrecioDetal: number; StockActual: number }>()
+    const variantesMap = new Map<number, { Atributo: string; Valor: string; PrecioAdicional: number; StockActual: number; Producto_Id: number }>()
 
     for (const it of carrito as Array<{ productoId: number; varianteId?: number | null; cantidad: number }>) {
       const prodRes = await pool
@@ -4833,11 +4897,11 @@ app.post('/public/pedidos', async (req, res) => {
         .input('productoId', it.productoId)
         .input('tiendaId', tiendaId)
         .query(`
-          SELECT Id, PrecioDetal, StockActual
+          SELECT Id, Nombre, PrecioDetal, StockActual
           FROM Productos
           WHERE Id = @productoId AND Tienda_Id = @tiendaId AND Visible = 1
         `)
-      const prod = prodRes.recordset[0] as { PrecioDetal: number; StockActual: number } | undefined
+      const prod = prodRes.recordset[0] as { Nombre: string; PrecioDetal: number; StockActual: number } | undefined
       if (!prod) {
         return res.status(400).json({ message: `Producto ${it.productoId} no encontrado o no disponible.` })
       }
@@ -4852,11 +4916,11 @@ app.post('/public/pedidos', async (req, res) => {
           .input('varianteId', it.varianteId)
           .input('productoId', it.productoId)
           .query(`
-            SELECT Id, PrecioAdicional, StockActual, Producto_Id
+            SELECT Id, Atributo, Valor, PrecioAdicional, StockActual, Producto_Id
             FROM Producto_Variaciones
             WHERE Id = @varianteId AND Producto_Id = @productoId
           `)
-        const vari = varRes.recordset[0] as { PrecioAdicional: number; StockActual: number; Producto_Id: number } | undefined
+        const vari = varRes.recordset[0] as { Atributo: string; Valor: string; PrecioAdicional: number; StockActual: number; Producto_Id: number } | undefined
         if (!vari) {
           return res.status(400).json({ message: `Variante ${it.varianteId} no encontrada para el producto.` })
         }
@@ -4866,8 +4930,12 @@ app.post('/public/pedidos', async (req, res) => {
       }
 
       if (stockDisponible < it.cantidad) {
+        const productoNombre = prod.Nombre ?? `Producto #${it.productoId}`
+        const variante = it.varianteId != null ? variantesMap.get(it.varianteId) : undefined
+        const varianteDesc = variante ? ` (${variante.Atributo}: ${variante.Valor})` : ''
+        const descripcion = `${productoNombre}${varianteDesc}`
         return res.status(400).json({
-          message: `Stock insuficiente para el producto ${it.productoId}${it.varianteId ? ` (variante)` : ''}. Disponible: ${stockDisponible}, solicitado: ${it.cantidad}.`,
+          message: `Stock insuficiente para "${descripcion}". Disponible: ${stockDisponible}, solicitado: ${it.cantidad}.`,
         })
       }
     }
