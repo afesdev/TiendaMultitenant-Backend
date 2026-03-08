@@ -934,7 +934,8 @@ app.get(
             v.Valor,
             v.PrecioAdicional,
             v.StockActual,
-            v.CodigoSKU
+            v.CodigoSKU,
+            v.CodigoBarras
           FROM Producto_Variaciones v
           INNER JOIN Productos p ON v.Producto_Id = p.Id
           WHERE p.Tienda_Id = @tiendaId
@@ -959,11 +960,12 @@ app.put(
     }
 
     const { id } = req.params
-    const { valor, stockActual, precioAdicional, codigoSKU } = req.body as {
+    const { valor, stockActual, precioAdicional, codigoSKU, codigoBarras } = req.body as {
       valor?: string
       stockActual?: number
       precioAdicional?: number
       codigoSKU?: string | null
+      codigoBarras?: string | null
     }
 
     try {
@@ -976,13 +978,15 @@ app.put(
         .input('stockActual', stockActual ?? null)
         .input('precioAdicional', precioAdicional ?? null)
         .input('codigoSKU', codigoSKU ?? null)
+        .input('codigoBarras', codigoBarras ?? null)
         .query(`
           UPDATE v
           SET
             Valor = COALESCE(@valor, v.Valor),
             StockActual = COALESCE(@stockActual, v.StockActual),
             PrecioAdicional = COALESCE(@precioAdicional, v.PrecioAdicional),
-            CodigoSKU = @codigoSKU
+            CodigoSKU = @codigoSKU,
+            CodigoBarras = @codigoBarras
           FROM Producto_Variaciones v
           INNER JOIN Productos p ON v.Producto_Id = p.Id
           WHERE v.Id = @id AND p.Tienda_Id = @tiendaId;
@@ -1012,13 +1016,14 @@ app.post(
       return res.status(401).json({ message: 'No autorizado' })
     }
 
-    const { productoId, atributo, valor, stockActual, precioAdicional, codigoSKU } = req.body as {
+    const { productoId, atributo, valor, stockActual, precioAdicional, codigoSKU, codigoBarras } = req.body as {
       productoId?: number
       atributo?: string
       valor?: string
       stockActual?: number
       precioAdicional?: number
       codigoSKU?: string | null
+      codigoBarras?: string | null
     }
 
     if (!productoId || !atributo || !valor) {
@@ -1053,6 +1058,7 @@ app.post(
         .input('stockActual', stockActual ?? 0)
         .input('precioAdicional', precioAdicional ?? 0)
         .input('codigoSKU', codigoSKU ?? null)
+        .input('codigoBarras', codigoBarras ?? null)
         .query(`
           INSERT INTO Producto_Variaciones (
             Producto_Id,
@@ -1060,9 +1066,10 @@ app.post(
             Valor,
             PrecioAdicional,
             StockActual,
-            CodigoSKU
+            CodigoSKU,
+            CodigoBarras
           )
-          VALUES (@productoId, @atributo, @valor, @precioAdicional, @stockActual, @codigoSKU);
+          VALUES (@productoId, @atributo, @valor, @precioAdicional, @stockActual, @codigoSKU, @codigoBarras);
         `)
 
       return res.status(201).json({ message: 'Variante creada' })
@@ -1589,7 +1596,7 @@ app.get(
         .request()
         .input('productoId', productoId)
         .query(`
-          SELECT Id, Atributo, Valor, PrecioAdicional, StockActual, CodigoSKU
+          SELECT Id, Atributo, Valor, PrecioAdicional, StockActual, CodigoSKU, CodigoBarras
           FROM Producto_Variaciones
           WHERE Producto_Id = @productoId
           ORDER BY Atributo, Valor
@@ -5717,7 +5724,7 @@ app.get('/public/productos/:id', async (req, res) => {
     // 3. Variaciones
     const variationsResult = await pool.request()
       .input('id', productoId)
-      .query(`SELECT Id, Atributo, Valor, PrecioAdicional, StockActual, CodigoSKU FROM Producto_Variaciones WHERE Producto_Id = @id`)
+      .query(`SELECT Id, Atributo, Valor, PrecioAdicional, StockActual, CodigoSKU, CodigoBarras FROM Producto_Variaciones WHERE Producto_Id = @id`)
     
     const variaciones = variationsResult.recordset as Array<{ Id: number; PrecioAdicional: number }>
     const tiendaIdProd = (await pool.request().input('id', productoId).query('SELECT Tienda_Id FROM Productos WHERE Id = @id')).recordset[0] as { Tienda_Id: string } | undefined
