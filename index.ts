@@ -74,6 +74,186 @@ app.get('/tiendas', async (_req, res) => {
   }
 })
 
+// ==========================
+// Colores (catálogo global)
+// ==========================
+
+// Listar colores
+app.get(
+  '/colores',
+  authMiddleware,
+  async (_req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    try {
+      const pool = await getPool()
+      const result = await pool.request().query(`
+        SELECT Id, Nombre, CodigoHex, CodigoInterno, Activo, FechaCreacion, FechaModificacion
+        FROM Colores
+        ORDER BY Nombre
+      `)
+      return res.json(result.recordset)
+    } catch (error) {
+      console.error('[GET /colores] Error', error)
+      return res
+        .status(500)
+        .json({ message: 'Error al obtener colores' })
+    }
+  },
+)
+
+// Crear color
+app.post(
+  '/colores',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'No autorizado' })
+    }
+
+    const { nombre, codigoHex, codigoInterno, activo } = req.body as {
+      nombre?: string
+      codigoHex?: string | null
+      codigoInterno?: string | null
+      activo?: boolean
+    }
+
+    if (!nombre || !nombre.trim()) {
+      return res
+        .status(400)
+        .json({ message: 'El nombre del color es obligatorio' })
+    }
+
+    const hexNormalizado =
+      typeof codigoHex === 'string' && codigoHex.trim()
+        ? (() => {
+            let h = codigoHex.trim()
+            if (!h.startsWith('#')) h = `#${h}`
+            return h.toUpperCase()
+          })()
+        : null
+
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('nombre', nombre.trim())
+        .input('codigoHex', hexNormalizado)
+        .input('codigoInterno', codigoInterno?.trim() || null)
+        .input('activo', activo ?? true)
+        .query(`
+          INSERT INTO Colores (Nombre, CodigoHex, CodigoInterno, Activo)
+          OUTPUT INSERTED.Id, INSERTED.Nombre, INSERTED.CodigoHex, INSERTED.CodigoInterno, INSERTED.Activo, INSERTED.FechaCreacion, INSERTED.FechaModificacion
+          VALUES (@nombre, @codigoHex, @codigoInterno, @activo)
+        `)
+
+      return res.status(201).json(result.recordset[0])
+    } catch (error) {
+      console.error('[POST /colores] Error', error)
+      return res.status(500).json({ message: 'Error al crear color' })
+    }
+  },
+)
+
+// Actualizar color
+app.put(
+  '/colores/:id',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'No autorizado' })
+    }
+
+    const { id } = req.params
+    const { nombre, codigoHex, codigoInterno, activo } = req.body as {
+      nombre?: string
+      codigoHex?: string | null
+      codigoInterno?: string | null
+      activo?: boolean
+    }
+
+    const hexNormalizado =
+      typeof codigoHex === 'string'
+        ? (() => {
+            const trimmed = codigoHex.trim()
+            if (!trimmed) return null
+            let h = trimmed
+            if (!h.startsWith('#')) h = `#${h}`
+            return h.toUpperCase()
+          })()
+        : undefined
+
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('id', Number(id))
+        .input('nombre', nombre ?? null)
+        .input('codigoHex', hexNormalizado ?? null)
+        .input('codigoInterno', codigoInterno ?? null)
+        .input('activo', typeof activo === 'boolean' ? activo : null)
+        .query(`
+          UPDATE Colores
+          SET
+            Nombre = COALESCE(@nombre, Nombre),
+            CodigoHex = CASE WHEN @codigoHex IS NULL THEN CodigoHex ELSE @codigoHex END,
+            CodigoInterno = CASE WHEN @codigoInterno IS NULL THEN CodigoInterno ELSE @codigoInterno END,
+            Activo = COALESCE(@activo, Activo),
+            FechaModificacion = SYSUTCDATETIME()
+          WHERE Id = @id;
+
+          SELECT Id, Nombre, CodigoHex, CodigoInterno, Activo, FechaCreacion, FechaModificacion
+          FROM Colores
+          WHERE Id = @id;
+        `)
+
+      if (result.recordset.length === 0) {
+        return res.status(404).json({ message: 'Color no encontrado' })
+      }
+
+      return res.json(result.recordset[0])
+    } catch (error) {
+      console.error('[PUT /colores/:id] Error', error)
+      return res.status(500).json({ message: 'Error al actualizar color' })
+    }
+  },
+)
+
+// Desactivar (soft-delete) color
+app.delete(
+  '/colores/:id',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'No autorizado' })
+    }
+
+    const { id } = req.params
+
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('id', Number(id))
+        .query(`
+          UPDATE Colores
+          SET Activo = 0, FechaModificacion = SYSUTCDATETIME()
+          WHERE Id = @id;
+
+          SELECT @@ROWCOUNT AS affected;
+        `)
+
+      const affected = (result.recordset[0]?.affected as number) ?? 0
+      if (!affected) {
+        return res.status(404).json({ message: 'Color no encontrado' })
+      }
+
+      return res.json({ message: 'Color desactivado' })
+    } catch (error) {
+      console.error('[DELETE /colores/:id] Error', error)
+      return res.status(500).json({ message: 'Error al desactivar color' })
+    }
+  },
+)
+
 // Middleware sencillo para extraer el usuario desde el JWT
 function authMiddleware(
   req: express.Request & { user?: JwtPayload },
@@ -230,6 +410,83 @@ async function addProductoImagen(
     return { id: row.Id, url: row.Url }
   } catch (error) {
     console.error('[addProductoImagen] Error', error)
+    return null
+  }
+}
+
+/** Sube una imagen a Firebase e inserta una fila en Producto_Variacion_Imagenes. */
+async function addProductoVarianteImagen(
+  productoId: number,
+  variacionId: number,
+  imagenBase64: string,
+  esPrincipal: boolean,
+  orden: number,
+  etiquetaAngulo: string | null,
+): Promise<{ id: number; url: string } | null> {
+  try {
+    const bucket = storage.bucket()
+    const base64Data = imagenBase64.includes(',')
+      ? imagenBase64.split(',')[1]!
+      : imagenBase64
+    const buffer = Buffer.from(base64Data, 'base64')
+    if (buffer.length === 0) return null
+
+    const fileName = `product_variant_images/${productoId}-${variacionId}-${Date.now()}-${orden}.jpg`
+    const file = bucket.file(fileName)
+    await file.save(buffer, { metadata: { contentType: 'image/jpeg' }, resumable: false })
+
+    let publicUrl: string
+    try {
+      await file.makePublic()
+      publicUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(
+        fileName,
+      )}?alt=media`
+    } catch {
+      const [signedUrl] = await file.getSignedUrl({
+        action: 'read',
+        expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        version: 'v4',
+      })
+      publicUrl = signedUrl
+    }
+
+    const pool = await getPool()
+
+    if (esPrincipal) {
+      await pool
+        .request()
+        .input('productoId', productoId)
+        .input('variacionId', variacionId)
+        .query(
+          `
+            UPDATE vi
+            SET vi.EsPrincipal = 0
+            FROM Producto_Variacion_Imagenes vi
+            WHERE vi.Producto_Id = @productoId AND vi.Variacion_Id = @variacionId
+          `,
+        )
+    }
+
+    const result = await pool
+      .request()
+      .input('productoId', productoId)
+      .input('variacionId', variacionId)
+      .input('url', publicUrl)
+      .input('esPrincipal', esPrincipal ? 1 : 0)
+      .input('orden', orden)
+      .input('etiquetaAngulo', etiquetaAngulo)
+      .query(
+        `
+          INSERT INTO Producto_Variacion_Imagenes (Producto_Id, Variacion_Id, Url, EtiquetaAngulo, EsPrincipal, Orden)
+          OUTPUT INSERTED.Id, INSERTED.Url
+          VALUES (@productoId, @variacionId, @url, @etiquetaAngulo, @esPrincipal, @orden)
+        `,
+      )
+
+    const row = result.recordset[0] as { Id: number; Url: string }
+    return { id: row.Id, url: row.Url }
+  } catch (error) {
+    console.error('[addProductoVarianteImagen] Error', error)
     return null
   }
 }
@@ -970,23 +1227,69 @@ app.put(
 
     try {
       const pool = await getPool()
+
+      // 1. Leer atributo y valor actuales de la variante (asegurando tienda)
+      const infoResult = await pool
+        .request()
+        .input('id', Number(id))
+        .input('tiendaId', req.user.tiendaId)
+        .query(`
+          SELECT v.Atributo, v.Valor
+          FROM Producto_Variaciones v
+          INNER JOIN Productos p ON v.Producto_Id = p.Id
+          WHERE v.Id = @id AND p.Tienda_Id = @tiendaId
+        `)
+
+      if (infoResult.recordset.length === 0) {
+        return res.status(404).json({ message: 'Variante no encontrada' })
+      }
+
+      const row = infoResult.recordset[0] as { Atributo: string; Valor: string }
+      const atributoActual = row.Atributo
+      const valorActual = row.Valor
+      const nuevoValor = valor ?? valorActual
+
+      // 2. Resolver Color_Id si es una variante de Color
+      let colorId: number | null = null
+      if (atributoActual.trim().toLowerCase() === 'color') {
+        const colorResult = await pool
+          .request()
+          .input('nombre', nuevoValor)
+          .query(`
+            SELECT TOP 1 Id
+            FROM Colores
+            WHERE Nombre = @nombre AND Activo = 1
+            ORDER BY Id
+          `)
+
+        if (colorResult.recordset.length > 0) {
+          colorId = colorResult.recordset[0].Id as number
+        }
+      }
+
+      // 3. Actualizar variante (incluyendo Color_Id cuando aplique)
       const result = await pool
         .request()
         .input('id', Number(id))
         .input('tiendaId', req.user.tiendaId)
-        .input('valor', valor ?? null)
+        .input('valor', nuevoValor)
         .input('stockActual', stockActual ?? null)
         .input('precioAdicional', precioAdicional ?? null)
         .input('codigoSKU', codigoSKU ?? null)
         .input('codigoBarras', codigoBarras ?? null)
+        .input('colorId', colorId)
         .query(`
           UPDATE v
           SET
-            Valor = COALESCE(@valor, v.Valor),
+            Valor = @valor,
             StockActual = COALESCE(@stockActual, v.StockActual),
             PrecioAdicional = COALESCE(@precioAdicional, v.PrecioAdicional),
             CodigoSKU = @codigoSKU,
-            CodigoBarras = @codigoBarras
+            CodigoBarras = @codigoBarras,
+            Color_Id = CASE 
+              WHEN LOWER(LTRIM(RTRIM(v.Atributo))) = 'color' THEN @colorId
+              ELSE v.Color_Id
+            END
           FROM Producto_Variaciones v
           INNER JOIN Productos p ON v.Producto_Id = p.Id
           WHERE v.Id = @id AND p.Tienda_Id = @tiendaId;
@@ -1016,7 +1319,15 @@ app.post(
       return res.status(401).json({ message: 'No autorizado' })
     }
 
-    const { productoId, atributo, valor, stockActual, precioAdicional, codigoSKU, codigoBarras } = req.body as {
+    const {
+      productoId,
+      atributo,
+      valor,
+      stockActual,
+      precioAdicional,
+      codigoSKU,
+      codigoBarras,
+    } = req.body as {
       productoId?: number
       atributo?: string
       valor?: string
@@ -1050,6 +1361,24 @@ app.post(
         return res.status(404).json({ message: 'Producto no encontrado para esta tienda' })
       }
 
+      // Resolver Color_Id si es una variante de Color
+      let colorId: number | null = null
+      if (atributo.trim().toLowerCase() === 'color') {
+        const colorResult = await pool
+          .request()
+          .input('nombre', valor)
+          .query(`
+            SELECT TOP 1 Id
+            FROM Colores
+            WHERE Nombre = @nombre AND Activo = 1
+            ORDER BY Id
+          `)
+
+        if (colorResult.recordset.length > 0) {
+          colorId = colorResult.recordset[0].Id as number
+        }
+      }
+
       await pool
         .request()
         .input('productoId', productoId)
@@ -1059,6 +1388,7 @@ app.post(
         .input('precioAdicional', precioAdicional ?? 0)
         .input('codigoSKU', codigoSKU ?? null)
         .input('codigoBarras', codigoBarras ?? null)
+        .input('colorId', colorId)
         .query(`
           INSERT INTO Producto_Variaciones (
             Producto_Id,
@@ -1067,9 +1397,10 @@ app.post(
             PrecioAdicional,
             StockActual,
             CodigoSKU,
-            CodigoBarras
+            CodigoBarras,
+            Color_Id
           )
-          VALUES (@productoId, @atributo, @valor, @precioAdicional, @stockActual, @codigoSKU, @codigoBarras);
+          VALUES (@productoId, @atributo, @valor, @precioAdicional, @stockActual, @codigoSKU, @codigoBarras, @colorId);
         `)
 
       return res.status(201).json({ message: 'Variante creada' })
@@ -1147,6 +1478,47 @@ app.get(
   },
 )
 
+// Listar imágenes de una variante de producto
+app.get(
+  '/productos/variantes/:id/imagenes',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const { id } = req.params
+    try {
+      const pool = await getPool()
+      const result = await pool
+        .request()
+        .input('variacionId', Number(id))
+        .input('tiendaId', req.user.tiendaId)
+        .query(
+          `
+            SELECT
+              vi.Id,
+              vi.Producto_Id,
+              vi.Variacion_Id,
+              vi.Url,
+              vi.EtiquetaAngulo,
+              vi.EsPrincipal,
+              vi.Orden
+            FROM Producto_Variacion_Imagenes vi
+            INNER JOIN Producto_Variaciones v ON vi.Variacion_Id = v.Id
+            INNER JOIN Productos p ON v.Producto_Id = p.Id
+            WHERE vi.Variacion_Id = @variacionId AND p.Tienda_Id = @tiendaId
+            ORDER BY vi.EsPrincipal DESC, vi.Orden ASC, vi.Id ASC
+          `,
+        )
+
+      return res.json(result.recordset)
+    } catch (error) {
+      console.error('[GET /productos/variantes/:id/imagenes] Error', error)
+      return res
+        .status(500)
+        .json({ message: 'Error al listar imágenes de la variante' })
+    }
+  },
+)
+
 // Añadir imagen a un producto
 app.post(
   '/productos/:id/imagenes',
@@ -1185,6 +1557,90 @@ app.post(
   },
 )
 
+// Añadir imagen a una variante de producto
+app.post(
+  '/productos/variantes/:id/imagenes',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const { id } = req.params
+    const { imagenBase64, esPrincipal, orden, etiquetaAngulo } = req.body as {
+      imagenBase64?: string
+      esPrincipal?: boolean
+      orden?: number
+      etiquetaAngulo?: string | null
+    }
+
+    if (!imagenBase64) {
+      return res
+        .status(400)
+        .json({ message: 'imagenBase64 es obligatorio' })
+    }
+
+    try {
+      const pool = await getPool()
+
+      const check = await pool
+        .request()
+        .input('variacionId', Number(id))
+        .input('tiendaId', req.user.tiendaId)
+        .query(
+          `
+            SELECT TOP 1 v.Producto_Id
+            FROM Producto_Variaciones v
+            INNER JOIN Productos p ON v.Producto_Id = p.Id
+            WHERE v.Id = @variacionId AND p.Tienda_Id = @tiendaId
+          `,
+        )
+
+      if (check.recordset.length === 0) {
+        return res
+          .status(404)
+          .json({ message: 'Variante no encontrada para esta tienda' })
+      }
+
+      const productoId = check.recordset[0].Producto_Id as number
+
+      const maxOrden = await pool
+        .request()
+        .input('productoId', productoId)
+        .input('variacionId', Number(id))
+        .query(
+          `
+            SELECT ISNULL(MAX(Orden), -1) + 1 AS NextOrden
+            FROM Producto_Variacion_Imagenes
+            WHERE Producto_Id = @productoId AND Variacion_Id = @variacionId
+          `,
+        )
+
+      const nextOrden =
+        orden ?? ((maxOrden.recordset[0]?.NextOrden as number) ?? 0)
+
+      const added = await addProductoVarianteImagen(
+        productoId,
+        Number(id),
+        imagenBase64,
+        !!esPrincipal,
+        nextOrden,
+        etiquetaAngulo ?? null,
+      )
+
+      if (!added) {
+        return res
+          .status(500)
+          .json({ message: 'Error al subir la imagen de la variante' })
+      }
+
+      return res.status(201).json(added)
+    } catch (error) {
+      console.error('[POST /productos/variantes/:id/imagenes] Error', error)
+      return res
+        .status(500)
+        .json({ message: 'Error al añadir imagen a la variante' })
+    }
+  },
+)
+
 // Eliminar imagen de producto
 app.delete(
   '/productos/imagenes/:imagenId',
@@ -1210,6 +1666,48 @@ app.delete(
     } catch (error) {
       console.error('[DELETE /productos/imagenes/:id] Error', error)
       return res.status(500).json({ message: 'Error al eliminar imagen' })
+    }
+  },
+)
+
+// Eliminar imagen de variante de producto
+app.delete(
+  '/productos/variantes/imagenes/:imagenId',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const { imagenId } = req.params
+
+    try {
+      const pool = await getPool()
+      const delResult = await pool
+        .request()
+        .input('imagenId', Number(imagenId))
+        .input('tiendaId', req.user.tiendaId)
+        .query(
+          `
+            DELETE vi
+            FROM Producto_Variacion_Imagenes vi
+            INNER JOIN Producto_Variaciones v ON vi.Variacion_Id = v.Id
+            INNER JOIN Productos p ON v.Producto_Id = p.Id
+            WHERE vi.Id = @imagenId AND p.Tienda_Id = @tiendaId
+          `,
+        )
+
+      const affected = (delResult.rowsAffected as number[])?.[0] ?? 0
+      if (!affected) {
+        return res.status(404).json({ message: 'Imagen no encontrada' })
+      }
+
+      return res.json({ message: 'Imagen de variante eliminada' })
+    } catch (error) {
+      console.error(
+        '[DELETE /productos/variantes/imagenes/:imagenId] Error',
+        error,
+      )
+      return res
+        .status(500)
+        .json({ message: 'Error al eliminar imagen de variante' })
     }
   },
 )
@@ -1247,6 +1745,72 @@ app.put(
     } catch (error) {
       console.error('[PUT /productos/imagenes/:id/principal] Error', error)
       return res.status(500).json({ message: 'Error al actualizar imagen principal' })
+    }
+  },
+)
+
+// Marcar imagen de variante como principal
+app.put(
+  '/productos/variantes/imagenes/:imagenId/principal',
+  authMiddleware,
+  async (req: express.Request & { user?: JwtPayload }, res: express.Response) => {
+    if (!req.user) return res.status(401).json({ message: 'No autorizado' })
+    const { imagenId } = req.params
+
+    try {
+      const pool = await getPool()
+
+      const infoResult = await pool
+        .request()
+        .input('imagenId', Number(imagenId))
+        .input('tiendaId', req.user.tiendaId)
+        .query(
+          `
+            SELECT TOP 1 vi.Producto_Id, vi.Variacion_Id
+            FROM Producto_Variacion_Imagenes vi
+            INNER JOIN Producto_Variaciones v ON vi.Variacion_Id = v.Id
+            INNER JOIN Productos p ON v.Producto_Id = p.Id
+            WHERE vi.Id = @imagenId AND p.Tienda_Id = @tiendaId
+          `,
+        )
+
+      if (infoResult.recordset.length === 0) {
+        return res.status(404).json({ message: 'Imagen no encontrada' })
+      }
+
+      const row = infoResult.recordset[0] as {
+        Producto_Id: number
+        Variacion_Id: number
+      }
+
+      await pool
+        .request()
+        .input('productoId', row.Producto_Id)
+        .input('variacionId', row.Variacion_Id)
+        .input('imagenId', Number(imagenId))
+        .query(
+          `
+            UPDATE vi
+            SET vi.EsPrincipal = 0
+            FROM Producto_Variacion_Imagenes vi
+            WHERE vi.Producto_Id = @productoId AND vi.Variacion_Id = @variacionId;
+
+            UPDATE vi
+            SET vi.EsPrincipal = 1
+            FROM Producto_Variacion_Imagenes vi
+            WHERE vi.Id = @imagenId AND vi.Producto_Id = @productoId AND vi.Variacion_Id = @variacionId;
+          `,
+        )
+
+      return res.json({ message: 'Imagen principal de variante actualizada' })
+    } catch (error) {
+      console.error(
+        '[PUT /productos/variantes/imagenes/:imagenId/principal] Error',
+        error,
+      )
+      return res.status(500).json({
+        message: 'Error al actualizar imagen principal de variante',
+      })
     }
   },
 )
@@ -1596,11 +2160,71 @@ app.get(
         .request()
         .input('productoId', productoId)
         .query(`
-          SELECT Id, Atributo, Valor, PrecioAdicional, StockActual, CodigoSKU, CodigoBarras
-          FROM Producto_Variaciones
-          WHERE Producto_Id = @productoId
-          ORDER BY Atributo, Valor
+          SELECT
+            v.Id,
+            v.Atributo,
+            v.Valor,
+            v.PrecioAdicional,
+            v.StockActual,
+            v.CodigoSKU,
+            v.CodigoBarras,
+            v.Color_Id,
+            col.Nombre AS ColorNombre,
+            col.CodigoHex AS ColorHex
+          FROM Producto_Variaciones v
+          LEFT JOIN Colores col ON v.Color_Id = col.Id
+          WHERE v.Producto_Id = @productoId
+          ORDER BY v.Atributo, v.Valor
         `)
+
+      const variantes = variantesResult.recordset as Array<{
+        Id: number
+        Atributo: string
+        Valor: string
+        PrecioAdicional: number
+        StockActual: number
+        CodigoSKU: string | null
+        CodigoBarras: string | null
+        Color_Id: number | null
+        ColorNombre: string | null
+        ColorHex: string | null
+      }>
+
+      const varImagesResult = await pool
+        .request()
+        .input('productoId', productoId)
+        .query(`
+          SELECT
+            vi.Id,
+            vi.Producto_Id,
+            vi.Variacion_Id,
+            vi.Url,
+            vi.EtiquetaAngulo,
+            vi.EsPrincipal,
+            vi.Orden
+          FROM Producto_Variacion_Imagenes vi
+          WHERE vi.Producto_Id = @productoId
+          ORDER BY vi.Variacion_Id, vi.EsPrincipal DESC, vi.Orden ASC, vi.Id ASC
+        `)
+
+      type ImagenVarianteDetalle = {
+        Id: number
+        Producto_Id: number
+        Variacion_Id: number
+        Url: string
+        EtiquetaAngulo: string | null
+        EsPrincipal: boolean
+        Orden: number
+      }
+
+      const imagenesPorVarianteDetalle = new Map<number, ImagenVarianteDetalle[]>()
+      for (const img of varImagesResult.recordset as ImagenVarianteDetalle[]) {
+        const arr = imagenesPorVarianteDetalle.get(img.Variacion_Id) ?? []
+        arr.push(img)
+        if (!imagenesPorVarianteDetalle.has(img.Variacion_Id)) {
+          imagenesPorVarianteDetalle.set(img.Variacion_Id, arr)
+        }
+      }
 
       const statsVentas = await pool
         .request()
@@ -1683,10 +2307,15 @@ app.get(
       const sv = statsVentas.recordset[0]
       const sa = statsApartados.recordset[0]
 
+      const variantesConImagenes = variantes.map((v) => ({
+        ...v,
+        Imagenes: imagenesPorVarianteDetalle.get(v.Id) ?? [],
+      }))
+
       return res.json({
         producto,
         imagenes: imagenesResult.recordset,
-        variantes: variantesResult.recordset,
+        variantes: variantesConImagenes,
         estadisticas: {
           totalVendido: Number(sv?.TotalVendido ?? 0),
           ingresosVentas: Number(sv?.IngresosVentas ?? 0),
@@ -5622,7 +6251,23 @@ app.get('/public/tiendas/:slug/productos', async (req, res) => {
             FROM Producto_Variaciones
             WHERE Producto_Id = p.Id AND Atributo = 'Color'
             FOR XML PATH('')), 1, 1, '')
-        ) AS Colores
+        ) AS Colores,
+        (
+          SELECT STUFF((
+            SELECT DISTINCT ',' + ISNULL(c.CodigoHex, '')
+            FROM Producto_Variaciones v
+            LEFT JOIN Colores c ON v.Color_Id = c.Id
+            WHERE v.Producto_Id = p.Id AND v.Atributo = 'Color' AND c.CodigoHex IS NOT NULL
+            FOR XML PATH('')), 1, 1, '')
+        ) AS ColoresHex,
+        (
+          SELECT STUFF((
+            SELECT ',' + pi.Url
+            FROM Producto_Imagenes pi
+            WHERE pi.Producto_Id = p.Id
+            ORDER BY pi.EsPrincipal DESC, pi.Orden ASC, pi.Id ASC
+            FOR XML PATH('')), 1, 1, '')
+        ) AS ImagenesLista
       FROM Productos p
       INNER JOIN Tiendas t ON p.Tienda_Id = t.Id
       LEFT JOIN Categorias c ON p.Categoria_Id = c.Id
@@ -5687,7 +6332,7 @@ app.get('/public/tiendas/:slug/productos', async (req, res) => {
   }
 })
 
-// Obtener detalle de un producto (incluye variaciones e imágenes)
+// Obtener detalle de un producto (incluye variaciones e imágenes, también por variante)
 app.get('/public/productos/:id', async (req, res) => {
   const { id } = req.params
   try {
@@ -5712,22 +6357,78 @@ app.get('/public/productos/:id', async (req, res) => {
       return res.status(404).json({ message: 'Producto no encontrado' })
     }
 
-    const producto = productResult.recordset[0]
+    type ProductoPublicRow = {
+      PrecioDetal: number
+      [key: string]: unknown
+    }
 
-    // 2. Imágenes
-    const imagesResult = await pool.request()
-      .input('id', productoId)
-      .query(`SELECT Id, Url, EsPrincipal, Orden FROM Producto_Imagenes WHERE Producto_Id = @id ORDER BY EsPrincipal DESC, Orden ASC`)
-    
-    producto.Imagenes = imagesResult.recordset
+    const producto = productResult.recordset[0] as ProductoPublicRow
 
-    // 3. Variaciones
-    const variationsResult = await pool.request()
+    // 2. Imágenes a nivel de producto
+    const imagesResult = await pool
+      .request()
       .input('id', productoId)
-      .query(`SELECT Id, Atributo, Valor, PrecioAdicional, StockActual, CodigoSKU, CodigoBarras FROM Producto_Variaciones WHERE Producto_Id = @id`)
-    
+      .query(`
+        SELECT Id, Url, EsPrincipal, Orden
+        FROM Producto_Imagenes
+        WHERE Producto_Id = @id
+        ORDER BY EsPrincipal DESC, Orden ASC, Id ASC
+      `)
+
+    ;(producto as { Imagenes?: unknown }).Imagenes = imagesResult.recordset
+
+    // 3. Variaciones del producto
+    const variationsResult = await pool
+      .request()
+      .input('id', productoId)
+      .query(`
+        SELECT Id, Atributo, Valor, PrecioAdicional, StockActual, CodigoSKU, CodigoBarras
+        FROM Producto_Variaciones
+        WHERE Producto_Id = @id
+      `)
+
     const variaciones = variationsResult.recordset as Array<{ Id: number; PrecioAdicional: number }>
-    const tiendaIdProd = (await pool.request().input('id', productoId).query('SELECT Tienda_Id FROM Productos WHERE Id = @id')).recordset[0] as { Tienda_Id: string } | undefined
+
+    // 4. Imágenes asociadas a variantes (opcional)
+    const varImagesResult = await pool
+      .request()
+      .input('productoId', productoId)
+      .query(`
+        SELECT
+          Id,
+          Producto_Id,
+          Variacion_Id,
+          Url,
+          EtiquetaAngulo,
+          EsPrincipal,
+          Orden
+        FROM Producto_Variacion_Imagenes
+        WHERE Producto_Id = @productoId
+        ORDER BY Variacion_Id, EsPrincipal DESC, Orden ASC, Id ASC
+      `)
+
+    type ImagenVariante = {
+      Id: number
+      Producto_Id: number
+      Variacion_Id: number
+      Url: string
+      EtiquetaAngulo: string | null
+      EsPrincipal: boolean
+      Orden: number
+    }
+
+    const imagenesPorVariante = new Map<number, ImagenVariante[]>()
+    for (const img of varImagesResult.recordset as ImagenVariante[]) {
+      const arr = imagenesPorVariante.get(img.Variacion_Id) ?? []
+      arr.push(img)
+      if (!imagenesPorVariante.has(img.Variacion_Id)) {
+        imagenesPorVariante.set(img.Variacion_Id, arr)
+      }
+    }
+
+    const tiendaIdProd = (await pool.request().input('id', productoId).query('SELECT Tienda_Id FROM Productos WHERE Id = @id')).recordset[0] as
+      | { Tienda_Id: string }
+      | undefined
     const tiendaId = tiendaIdProd?.Tienda_Id
 
     if (tiendaId) {
@@ -5742,23 +6443,32 @@ app.get('/public/productos/:id', async (req, res) => {
         })),
       ]
       const conPromo = await calcularPrecioConPromo(pool, tiendaId, itemsPromo)
-      producto.PrecioOferta = conPromo[0]?.precioFinal ?? precioBase
-      producto.TieneOferta = (conPromo[0]?.descuentoAplicado ?? 0) > 0
+      ;(producto as { PrecioOferta?: number }).PrecioOferta =
+        conPromo[0]?.precioFinal ?? precioBase
+      ;(producto as { TieneOferta?: boolean }).TieneOferta =
+        (conPromo[0]?.descuentoAplicado ?? 0) > 0
       for (let i = 0; i < variaciones.length; i++) {
         const v = variaciones[i] as Record<string, unknown>
         v.PrecioOferta = conPromo[i + 1]?.precioFinal ?? precioBase + (variaciones[i].PrecioAdicional ?? 0)
         v.TieneOferta = (conPromo[i + 1]?.descuentoAplicado ?? 0) > 0
       }
     } else {
-      producto.PrecioOferta = producto.PrecioDetal
-      producto.TieneOferta = false
+      ;(producto as { PrecioOferta?: number }).PrecioOferta = producto.PrecioDetal
+      ;(producto as { TieneOferta?: boolean }).TieneOferta = false
       for (const v of variaciones) {
         ;(v as Record<string, unknown>).PrecioOferta = producto.PrecioDetal + (v.PrecioAdicional ?? 0)
         ;(v as Record<string, unknown>).TieneOferta = false
       }
     }
 
-    producto.Variaciones = variaciones
+    // Adjuntar imágenes por variante (si existen)
+    for (const v of variaciones as Array<Record<string, unknown>>) {
+      const idVar = v.Id as number | undefined
+      if (!idVar) continue
+      v.Imagenes = imagenesPorVariante.get(idVar) ?? []
+    }
+
+    ;(producto as { Variaciones?: unknown }).Variaciones = variaciones
 
     res.json(producto)
   } catch (error) {
